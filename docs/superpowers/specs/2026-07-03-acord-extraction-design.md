@@ -76,8 +76,9 @@ annual_gross_revenue: {
 | `extraction/extractor` | transcript(s) → Zod-validated facts w/ provenance + confidence | `LlmClient` |
 | `profile/reconciler` | Merge fact candidates into canonical profile; conflict detection | facts repo |
 | `forms/renderers` | Pure `profile → {field name: value}` projections for 125 & 126 | — |
-| `forms/fillForm` | Stub: `(formType, mapping) → bytes`; writes to blob store | blob store |
-| `review/ReviewClient` | The TS "UI stand-in": list/get drafts, get field + provenance, edit field, approve form (→ fillForm) | facts + drafts repos |
+| `forms/fillForm` | Stub: `(formType, mapping) → bytes`; writes to blob store at a deterministic key | blob store |
+| `review/ReviewClient` | The TS "UI stand-in": list/get drafts, get field + provenance, `approveForm(edits?)` (one short txn) | facts + drafts + outbox repos |
+| `outbox/worker` | In-process relay: wake-on-commit + adaptive backstop poll; claims outbox rows, calls `fillForm`, `approved→filled`, per-row retry backoff | outbox repo, fillForm |
 | `processor` | Orchestrates: new source → extract → reconcile → re-project drafts → needs_review | above |
 
 The LLM sits behind `LlmClient` so extraction is deterministic and testable with canned structured responses.
@@ -94,6 +95,10 @@ The LLM sits behind `LlmClient` so extraction is deterministic and testable with
 - **form_drafts**(`id` PK, `customer_id`, `form_type`, `projected_json`, `status`
   [`needs_review`|`approved`|`filled`], `approved_by`, `approved_at`, `pdf_ref`,
   `updated_at`) — materialized projection for review + fill.
+- **outbox**(`id` PK, `customer_id`, `form_type`, `payload_json` (the approved mapping),
+  `status` [`pending`|`processing`|`done`|`dead`], `attempts`, `next_attempt_at`,
+  `locked_at`, `created_at`) — durable intent-to-fill; written in the same transaction as
+  the approval.
 - **customers**(`id` PK, `name`, `dba`, `owner`) — minimal.
 
 The append-only `facts` ledger is what enables audit + correction detection. A simpler
@@ -120,6 +125,75 @@ current value per field:
 
 Because ordering is by `source_date`, a late-arriving *older* transcript cannot clobber
 newer info, and a genuine correction in a later call supersedes the earlier value.
+
+## Approval, Atomicity & the Outbox
+
+Editing-a-correction and approving are the **same action** — approval optionally carries
+edits. One method, one short transaction:
+
+```ts
+reviewClient.approveForm(customerId, "acord_125", { edits: { annual_gross_revenue: 2800000 } })
+```
+
+The transaction does DB-only work and nothing else:
+
+1. Apply human edits → facts get `review_status: "approved"`, `reviewed_value` set.
+2. **Re-project** the form draft JSON from the just-corrected state (persisted JSON and
+   the PDF input are therefore guaranteed identical — no drift).
+3. `form_drafts.status = approved`.
+4. Insert an **outbox** row (`pending`) carrying the approved mapping.
+5. **Commit.**
+
+### Why an outbox and not a synchronous `fillForm`
+
+**Never hold a DB transaction open across an external I/O call.** Calling `fillForm`
+(PDF render + blob upload) inside the approve transaction would hold SQLite's
+**single writer** lock for a network round-trip, serializing every other approval behind
+the slowest external call. It also couples the review workflow's availability to the PDF
+service — a `fillForm` outage would block approvals and a transient blip would roll back a
+human's sign-off, forcing a re-click.
+
+The atomic unit that *must* be atomic is **{corrected JSON + approval + intent-to-fill}** —
+all DB, one transaction. The PDF is a **downstream effect**, not part of the decision.
+`approveForm()` returns the instant the decision is durable (read-your-writes on the
+approval); the PDF follows a beat later and status flows `approved → filled`.
+
+### Capture & consume (this system)
+
+**In-process transactional outbox with a polling relay. No CDC, no external broker** —
+CDC (Debezium/Kafka) is both over-weight for one PDF worker and unavailable on SQLite
+(no logical-replication CDC). The outbox table *is* the queue.
+
+- **Wake-on-commit (primary):** the in-process worker is nudged the moment the approve
+  transaction commits → PDF starts in sub-100ms.
+- **Adaptive backstop poll:** only a durability net for signals lost to a crash/restart.
+  Drain when kicked; when a poll finds nothing, back off (~1s → ~30s ceiling), snap back on
+  work. It exists so a crash can't strand an approved form, not to notice normal approvals.
+- **Claim a batch atomically:** `UPDATE outbox SET status='processing', locked_at=? WHERE
+  status='pending' LIMIT n` — trivial under SQLite's single writer.
+- **Per-row retry backoff:** on `fillForm` failure, bump `attempts` + set `next_attempt_at`
+  (exponential: 5s → 30s → 2m → 10m…); the poller skips future-dated rows; dead-letter
+  (`status='dead'`) after N.
+- **Idempotency:** `fillForm` writes to a **deterministic blob key**
+  `pdf/{customerId}/{formType}/{contentHash}`, so at-least-once delivery / retries
+  overwrite the same object — never a duplicate or wrong-data PDF. Effectively
+  exactly-once *fulfillment*, plus an audit trail of attempts.
+
+### Upgrade seams (built as labels, not code)
+
+Because the write path only ever *writes a row*, both scale-ups are non-invasive and
+independent — neither touches `approveForm`:
+
+1. **Consume side:** swap the in-process worker for **SQS/PubSub + a worker fleet**.
+2. **Capture side:** swap polling for **CDC/Debezium** — only once already on Postgres +
+   Kafka for other reasons and polling latency/load actually hurts.
+
+### Shared-field ripple
+
+Forms are projections of one profile, so editing a **shared** field (e.g.
+`mailing_address`) while approving ACORD 125 changes the value ACORD 126 also draws from.
+An already-approved/filled ACORD 126 is therefore bumped back to `needs_review` (flagged),
+never silently overwritten. Approval stays per-form; shared edits ripple as **re-review**.
 
 ## Extraction Judgment (from the sample transcript)
 
@@ -149,7 +223,10 @@ The extractor must handle messy speech and prefer flagging over inventing precis
 
 - **Unit:** renderers (profile→fields, incl. shared fields), reconciler (corrections,
   out-of-order, human-edit protection), extractor with mocked `LlmClient`, `ReviewClient`.
-- **Integration:** webhook → process → draft → review → edit → approve → fillForm, mock LLM.
+- **Outbox worker:** claim/lease, retry backoff + dead-letter, idempotent re-delivery
+  (same deterministic key → no dup), wake-on-commit vs backstop-poll paths.
+- **Integration:** webhook → process → draft → review → edit → `approveForm` → outbox →
+  worker → `fillForm` → `filled`, mock LLM; plus shared-field ripple to `needs_review`.
 - **Fixtures:** the real `transcripts.json` plus a synthetic correction transcript (e.g. a
   revenue correction / payroll follow-up) to exercise the multi-transcript path.
 
@@ -161,10 +238,11 @@ The extractor must handle messy speech and prefer flagging over inventing precis
 4. Reconciler (the reducer + conflict detection).
 5. Form renderers (125, 126) — the DRY payoff.
 6. Processor orchestration.
-7. `fillForm` stub.
-8. `ReviewClient` class.
-9. Webhook (Fastify) + async job wiring.
-10. Tests throughout.
+7. `fillForm` stub + deterministic blob key.
+8. `ReviewClient.approveForm` (short txn: edits + approval + outbox row) + shared-field ripple.
+9. Outbox worker (wake-on-commit + adaptive backstop poll + per-row retry backoff).
+10. Webhook (Fastify) + async job wiring.
+11. Tests throughout.
 
 ## Alternatives Considered
 
@@ -174,5 +252,10 @@ The extractor must handle messy speech and prefer flagging over inventing precis
 - **Re-extract everything on each new transcript:** simplest merge story but clobbers
   human edits and is costly/non-deterministic. Rejected in favor of source-dated
   candidate reconciliation.
+- **Synchronous `fillForm` inside the approve transaction:** matches "approve → PDF now"
+  literally, but holds SQLite's single-writer lock across external I/O and couples review
+  availability to the PDF service. Rejected for the outbox.
+- **CDC (Debezium/Kafka) to capture the outbox:** correct at scale with existing Kafka,
+  but over-weight for one worker and unavailable on SQLite. Deferred as a capture-side seam.
 - **Split Python + TS:** most production-realistic but two languages in a short build;
   rejected for single-language clarity.
