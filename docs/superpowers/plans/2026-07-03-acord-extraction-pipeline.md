@@ -6,12 +6,12 @@
 
 **Architecture:** Transcripts land durably (source + `processing_jobs` row in one txn). A claim-based processor extracts facts (value + presence + provenance + confidence) into an append-only ledger; each ACORD form is a pure projection of the canonical profile. `approveForm` commits the human decision + an outbox row in one short txn; an in-process token-fenced worker calls `fillForm` asynchronously. Correctness edges (out-of-order corrections, stable collection IDs, lease recovery, immutable filled drafts) are first-class.
 
-**Tech Stack:** TypeScript (ESM), Node 20+, Fastify, Zod, better-sqlite3, Vercel AI SDK (`generateText` + `Output.object`, behind `LlmClient`), Vitest.
+**Tech Stack:** TypeScript (ESM), Node 20+, Fastify, Zod, better-sqlite3, Vercel AI SDK v6 (`generateText` + `Output.object`, behind `LlmClient`), Vitest.
 
 ## Global Constraints
 
 - **Language:** TypeScript, ESM (`"type": "module"`), `strict: true`. Node ≥ 20.
-- **LLM API:** Vercel AI SDK current structured-output API — `generateText({ output: Output.object({ schema }) })`. `generateObject` is deprecated; do not use it. All LLM access goes through the `LlmClient` interface; nothing else imports `ai` directly.
+- **LLM API:** Vercel AI SDK **v6** (`ai@^6`, `@ai-sdk/openai@^3`) structured-output API — top-level `generateText({ output: Output.object({ schema }) })`, reading `result.output`. `generateObject` is deprecated; do not use it. The `@ai-sdk/openai` major must be the one that lists `ai@^6` as its peer (v3.x at time of writing) — if npm reports a peer-dep conflict, take the provider major the installed `ai@6` requires. All LLM access goes through the `LlmClient` interface; nothing else imports `ai` directly.
 - **DB:** better-sqlite3 (synchronous). Every write path that spans >1 row is wrapped in a single `db.transaction(...)`. Never call external I/O (`fillForm`, blob writes) inside a DB transaction.
 - **Field paths:** scalars/fixed objects use static dotted paths (`mailing_address.street`); repeated collections use `collection.{item_id}.field` — **never** array indices in the canonical store.
 - **Presence is explicit:** every fact has `presence ∈ {present, missing, needs_follow_up, not_applicable}`; `evidence` is `null` for `missing`. No bare ambiguous nulls.
@@ -36,6 +36,14 @@ deliberately wires a **representative field set**, not all of `schema.md`:
 - `annual_payroll`, `prior_carrier_*`, and the collections `locations`,
   `prior_carriers`, `hazard_classifications`, `additional_insureds`, `products_schedule`
   are **not** bound to a form in this build.
+- **Reviewer-initiated `not_applicable` is deferred.** `markApproved` sets `review_status`
+  and `reviewed_value_json` only — it does **not** mutate `presence`. Two consequences:
+  - **Supported:** approving a field that is already `missing`/`needs_follow_up` with a null
+    value (`markApproved(id, null, …)`) → the read model reports `approved_blank` (a human
+    signed off on leaving it blank). This path works end-to-end and is tested.
+  - **Not built:** a reviewer explicitly flipping a `present` field to `not_applicable`. That
+    needs a `markNotApplicable` write path (a one-line `UPDATE … SET presence='not_applicable'`)
+    plus a `ReviewClient` method + wiring. It is a mechanical extension, intentionally omitted.
 
 Extending to every field is **mechanical**: add rows to `STATIC_BINDINGS` /
 `COLLECTION_BINDINGS` and fields to `ExtractionEnvelope`. No architecture changes. Any field
@@ -111,8 +119,8 @@ tests/
     "dev": "tsx src/server.ts"
   },
   "dependencies": {
-    "ai": "^5.0.0",
-    "@ai-sdk/openai": "^2.0.0",
+    "ai": "^6.0.0",
+    "@ai-sdk/openai": "^3.0.0",
     "better-sqlite3": "^11.0.0",
     "fastify": "^5.0.0",
     "uuid": "^11.0.0",
@@ -400,8 +408,15 @@ export interface Fact {
 import type { FormType } from './profile.js'
 export type { FormType }
 
-/** A rendered form value: dotted ACORD field path -> primitive value (or null). */
-export type FormMapping = Record<string, string | number | null>
+/**
+ * Any JSON-serialisable value. The real `fill_form` contract (see README) accepts nested
+ * objects (`mailing_address: { street, city, ... }`) and arrays (`prior_carriers: [...]`),
+ * not just scalars — `FormMapping` must be able to represent them.
+ */
+export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue }
+
+/** A rendered form: ACORD field name -> JSON value (scalar, nested object, or array). */
+export type FormMapping = Record<string, JsonValue>
 
 /** One resolved per-draft binding row emitted by a renderer. */
 export interface FieldBinding {
@@ -647,7 +662,17 @@ import { newLockToken } from '../util/id.js'
 export class LeaseClaimer {
   constructor(private db: DB, private table: string) {}
 
-  /** Atomically lease up to `limit` rows that are pending or lease-expired and due. */
+  /**
+   * Atomically lease up to `limit` rows that are pending or lease-expired and due.
+   *
+   * Two workers on separate connections must never claim the same row. Guarantees:
+   *  - `.immediate()` starts the transaction with `BEGIN IMMEDIATE`, taking SQLite's
+   *    write lock up front — concurrent claimers serialize instead of both reading the
+   *    same pending set under a shared read lock and then colliding on UPDATE.
+   *  - Each UPDATE re-checks the claimable predicate in its `WHERE` (guarded update),
+   *    so even without the lock a row already taken by another worker yields
+   *    `changes === 0` and is skipped. We return ONLY rows whose update won.
+   */
   claim(now: string, leaseMs: number, workerId: string, limit: number): { id: string; lock_token: string }[] {
     const lockedUntil = new Date(new Date(now).getTime() + leaseMs).toISOString()
     const tx = this.db.transaction(() => {
@@ -660,16 +685,16 @@ export class LeaseClaimer {
       const out: { id: string; lock_token: string }[] = []
       const upd = this.db.prepare(
         `UPDATE ${this.table} SET status='processing', locked_until=@lockedUntil, lock_token=@token, locked_by=@workerId
-         WHERE id=@id`
+         WHERE id=@id AND (status='pending' OR (status='processing' AND locked_until < @now))`
       )
       for (const r of rows) {
         const token = newLockToken()
-        upd.run({ id: r.id, lockedUntil, token, workerId })
-        out.push({ id: r.id, lock_token: token })
+        const info = upd.run({ id: r.id, now, lockedUntil, token, workerId })
+        if (info.changes === 1) out.push({ id: r.id, lock_token: token }) // only winners
       }
       return out
     })
-    return tx()
+    return tx.immediate() // BEGIN IMMEDIATE: acquire the write lock before selecting
   }
 
   /** Mark done — only the current lease holder of a still-processing row wins (fencing). */
@@ -1576,6 +1601,12 @@ export class FactsRepo {
     return out
   }
 
+  /**
+   * Approve a fact, optionally overriding its value (a human correction). Does NOT change
+   * `presence`: approving a non-present fact with `reviewedValueJson=null` yields the
+   * `approved_blank` read state (sign-off on leaving it blank). Reviewer-initiated
+   * present→not_applicable is a deferred extension — see Explicit Scope / Deferrals.
+   */
   markApproved(id: string, reviewedValueJson: string | null, by: string, at: string): void {
     this.db.prepare(`UPDATE facts SET review_status='approved', reviewed_value_json=?, reviewed_by=?, reviewed_at=? WHERE id=?`)
       .run(reviewedValueJson, by, at, id)
@@ -1826,6 +1857,31 @@ describe('DraftsRepo + OutboxRepo', () => {
     expect(drafts.current('c1', 'acord_125')!.revision).toBe(2)
   })
 
+  it('upsertProjection over a FILLED draft mints a new revision and supersedes the old', () => {
+    const r1 = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-01-01T00:00:00Z')
+    drafts.markFilled(r1.id, 'pdf/x', '2025-01-01T00:01:00Z')
+    // A later transcript reprojects the SAME form via upsertProjection (not newRevision).
+    const r2 = drafts.upsertProjection('c1', 'acord_125', { fein: 'B' }, '2025-01-02T00:00:00Z')
+    expect(r2.revision).toBe(2)
+    expect(r2.status).toBe('needs_review')                     // must be re-reviewed
+    expect(drafts.byId(r1.id)!.status).toBe('filled')          // old stays filled (immutable)
+    expect(drafts.byId(r1.id)!.superseded_by_revision).toBe(2) // no dangling current row
+    // Exactly one current row for the (customer, form).
+    const currentRows = db.prepare(
+      "SELECT COUNT(*) n FROM form_drafts WHERE customer_id='c1' AND form_type='acord_125' AND superseded_by_revision IS NULL"
+    ).get() as { n: number }
+    expect(currentRows.n).toBe(1)
+  })
+
+  it('upsertProjection over a non-filled draft overwrites in place (same revision)', () => {
+    const r1 = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-01-01T00:00:00Z')
+    drafts.approve(r1.id, 'sarah', '2025-01-01T00:00:30Z')
+    const r2 = drafts.upsertProjection('c1', 'acord_125', { fein: 'B' }, '2025-01-02T00:00:00Z')
+    expect(r2.revision).toBe(1)                                 // same row
+    expect(r2.status).toBe('needs_review')                     // approval invalidated by new data
+    expect(JSON.parse(r2.projected_json).fein).toBe('B')
+  })
+
   it('enqueues and finds a pending outbox row, then cancels it', () => {
     const id = outbox.enqueue('c1', 'acord_125', 1, { fein: 'A' }, 'hash', '2025-01-01T00:00:00Z')
     expect(outbox.pendingForForm('c1', 'acord_125')!.id).toBe(id)
@@ -1882,15 +1938,23 @@ export class DraftsRepo {
     return r.m ?? 0
   }
 
-  /** Create rev 1 if none, else overwrite the current (non-filled) revision's projection in place. */
+  /**
+   * Reproject the current draft from fresh facts.
+   *  - no current row → create revision 1.
+   *  - current is 'filled' → a filled draft is IMMUTABLE (its PDF may be at a carrier), so we
+   *    mint a new needs_review revision and mark the old row superseded. Routed through
+   *    newRevision() so `superseded_by_revision` is always set — never a dangling filled row
+   *    with `superseded_by_revision IS NULL` (which would break the single-current invariant).
+   *  - current is needs_review/approved (not yet filled) → overwrite its projection in place
+   *    and reset to needs_review; new data invalidates any prior approval, so it re-reviews.
+   */
   upsertProjection(customerId: string, formType: FormType, mapping: FormMapping, now: string): DraftRow {
     const cur = this.current(customerId, formType)
-    if (cur && cur.status !== 'filled') {
-      this.db.prepare('UPDATE form_drafts SET projected_json=?, status=?, updated_at=? WHERE id=?')
-        .run(JSON.stringify(mapping), 'needs_review', now, cur.id)
-      return this.byId(cur.id)!
-    }
-    return this.insert(customerId, formType, (cur?.revision ?? 0) + 1, mapping, now)
+    if (!cur) return this.insert(customerId, formType, 1, mapping, now)
+    if (cur.status === 'filled') return this.newRevision(customerId, formType, mapping, now)
+    this.db.prepare('UPDATE form_drafts SET projected_json=?, status=?, updated_at=? WHERE id=?')
+      .run(JSON.stringify(mapping), 'needs_review', now, cur.id)
+    return this.byId(cur.id)!
   }
 
   newRevision(customerId: string, formType: FormType, mapping: FormMapping, now: string): DraftRow {
@@ -1972,7 +2036,7 @@ export class OutboxRepo {
 - [ ] **Step 5: Run to verify it passes**
 
 Run: `npx vitest run tests/db/repos.test.ts`
-Expected: PASS (3 tests).
+Expected: PASS (5 tests).
 
 - [ ] **Step 6: Commit**
 
@@ -2059,6 +2123,21 @@ describe('ReviewClient.approveForm', () => {
     expect(cur126.status).toBe('needs_review')            // must be re-reviewed
     expect(drafts.byId(d126.id)!.status).toBe('filled')   // old 126 stays filled (immutable)
     expect(drafts.byId(d126.id)!.superseded_by_revision).toBe(2)
+  })
+
+  it('shared-field ripple cancels the OTHER form’s still-pending fill', () => {
+    // 126 is approved with a fill still queued (not yet run by the worker).
+    seedFact(facts, 'employee_count_full_time', 35)
+    const d126 = drafts.upsertProjection('c1', 'acord_126', { employee_count_full_time: 35 }, '2025-03-15T00:00:00Z')
+    drafts.approve(d126.id, 'sarah', '2025-03-15T00:00:00Z')
+    const pending126 = outbox.enqueue('c1', 'acord_126', d126.revision, { employee_count_full_time: 35 }, 'h', '2025-03-15T00:00:00Z')
+    // Now a shared field is edited while approving 125.
+    rc.approveForm('c1', 'acord_125', { edits: { employee_count_full_time: 40 }, by: 'sarah' })
+    // The stale 126 fill (targeting the now-superseded revision) is cancelled, not left to run.
+    expect(outbox.get(pending126)!.status).toBe('cancelled')
+    const cur126 = drafts.current('c1', 'acord_126')!
+    expect(cur126.revision).toBe(2)
+    expect(cur126.status).toBe('needs_review')
   })
 
   it('re-approving a filled form supersedes it onto a new revision', () => {
@@ -2207,6 +2286,12 @@ export class ReviewClient {
           if (!reads) continue
           const otherDraft = drafts.current(customerId, other)
           if (!otherDraft || (otherDraft.status !== 'approved' && otherDraft.status !== 'filled')) continue
+          // Cancel any in-flight fill for the other form FIRST: it targets the revision we are
+          // about to supersede, so letting it run would fill stale, pre-edit data. The worker's
+          // revision guard already refuses to markFilled a superseded draft, but cancelling
+          // also avoids the wasted fillForm call and a dangling PDF.
+          const otherPending = outbox.pendingForForm(customerId, other)
+          if (otherPending) outbox.cancel(otherPending.id)
           const r = renderForm(other, fresh)
           const rev = drafts.newRevision(customerId, other, r.mapping, now)
           drafts.saveBindings(rev.id, r.fieldBindings)
@@ -2227,7 +2312,7 @@ export class ReviewClient {
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `npx vitest run tests/review/reviewClient.test.ts`
-Expected: PASS (4 tests).
+Expected: PASS (6 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -2289,6 +2374,20 @@ describe('OutboxWorker.drainOnce', () => {
     expect(n).toBe(0)
     expect(drafts.byId(d.id)!.status).not.toBe('filled')
   })
+
+  it('completion+fill are atomic: if markFilled throws, outbox does NOT become done', async () => {
+    const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
+    drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, 'hash', '2025-03-16T00:00:00Z')
+    const orig = drafts.markFilled.bind(drafts)
+    ;(drafts as any).markFilled = () => { throw new Error('crash after complete()') }
+    const n = await worker.drainOnce()
+    ;(drafts as any).markFilled = orig
+    expect(n).toBe(0)
+    // The txn rolled back: the row is NOT 'done' and NOT stranded — it stays claimable.
+    expect(outbox.get(oid)!.status).not.toBe('done')
+    expect(drafts.byId(d.id)!.status).not.toBe('filled')
+  })
 })
 ```
 
@@ -2329,22 +2428,37 @@ export class OutboxWorker {
       if (!row || row.status !== 'processing') continue
       try {
         const mapping = JSON.parse(row.payload_json) as FormMapping
+        // External I/O (PDF generation) happens OUTSIDE any DB transaction.
         const { pdf_ref } = await fillForm(row.customer_id, row.form_type as FormType, mapping, this.d.blob)
-        // Fenced completion: only if we still hold the lease on a still-processing row.
-        const won = this.d.lease.complete(id, lock_token)
-        if (won) {
+        // Commit `outbox=done` AND `draft=filled` atomically. If the process dies between
+        // them, neither lands: the row is still 'processing', its lease expires, and it is
+        // re-fetched — never stranded as a done outbox row over an unfilled draft.
+        // `complete()` is fenced (id+token+status='processing'); if we lost the lease it
+        // returns false and we throw to roll the whole transaction back (no markFilled).
+        const commit = this.d.db.transaction(() => {
+          if (!this.d.lease.complete(id, lock_token)) throw new Error('lost lease')
           const draft = this.d.drafts.current(row.customer_id, row.form_type as FormType)
           if (draft && draft.revision === row.draft_revision) this.d.drafts.markFilled(draft.id, pdf_ref, this.d.clock.now())
-          filled++
+        })
+        try {
+          commit(); filled++
+        } catch {
+          // Rolled back (lost lease, or a local write failed). fail() is fenced: a no-op if
+          // we no longer hold the lease, otherwise it applies backoff + dead-letters at max.
+          // fillForm is idempotent on customer+form+revision, so a retry is safe.
+          this.fail(id, lock_token, row.attempts, now)
         }
       } catch {
-        const attempt = row.attempts
-        const backoff = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)]!
-        const next = new Date(new Date(now).getTime() + backoff).toISOString()
-        this.d.lease.fail(id, lock_token, next, this.d.maxAttempts ?? 5)
+        this.fail(id, lock_token, row.attempts, now)
       }
     }
     return filled
+  }
+
+  private fail(id: string, lockToken: string, attempts: number, now: string): void {
+    const backoff = BACKOFF_MS[Math.min(attempts, BACKOFF_MS.length - 1)]!
+    const next = new Date(new Date(now).getTime() + backoff).toISOString()
+    this.d.lease.fail(id, lockToken, next, this.d.maxAttempts ?? 5)
   }
 }
 ```
@@ -2352,7 +2466,7 @@ export class OutboxWorker {
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `npx vitest run tests/worker/outboxWorker.test.ts`
-Expected: PASS (2 tests).
+Expected: PASS (3 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -2436,6 +2550,25 @@ describe('Processor.drainOnce', () => {
     await makeProcessor().drainOnce()
     expect(new ProcessingJobsRepo(db).get(jobId)!.status).toBe('done')
     expect(await makeProcessor().drainOnce()).toBe(0)
+  })
+
+  it('persistence + job completion are atomic: a lost lease at commit rolls back ALL persistence', async () => {
+    const sourceId = newId(), jobId = newId()
+    insertSourceAndJob(db, {
+      source: { id: sourceId, customer_id: 'c1', type: 'call_transcript', source_date: '2025-03-12T10:30:00Z',
+        received_at: '2025-03-12T10:31:00Z', raw_json: JSON.stringify({ content: 'about $30,000; roughly 35 full-time guys' }), checksum: 'x' },
+      job: { id: jobId, source_id: sourceId, customer_id: 'c1', next_attempt_at: '2025-03-12T10:31:00Z', created_at: '2025-03-12T10:31:00Z' },
+    })
+    const proc = makeProcessor()
+    // Simulate losing the lease exactly at commit (another worker reclaimed after our lease expired).
+    ;((proc as any).d.lease as LeaseClaimer).complete = () => false
+    const n = await proc.drainOnce()
+    expect(n).toBe(0)
+    // Because completion is INSIDE the persist transaction, its failure rolls everything back:
+    // no facts, no draft, and the job is NOT marked done (it stays reclaimable).
+    expect(new FactsRepo(db).byField('c1', 'annual_gross_revenue').length).toBe(0)
+    expect(new DraftsRepo(db).current('c1', 'acord_125')).toBeFalsy()
+    expect(new ProcessingJobsRepo(db).get(jobId)!.status).not.toBe('done')
   })
 })
 ```
@@ -2549,7 +2682,12 @@ export class Processor {
           transcript, clock: this.d.clock, itemsRepo: this.d.items,
         })
 
-        const persist = this.d.db.transaction(() => {
+        // Persistence AND job completion commit together in one transaction. If the process
+        // dies before commit, nothing lands and the job (still 'processing') is reclaimed and
+        // redone cleanly. If it commits, the job is 'done' in the SAME commit — so a reclaim can
+        // never re-run upsertProjection over a draft a human approved in the meantime. The
+        // async llm.extract already ran ABOVE, outside any transaction.
+        const persistAndComplete = this.d.db.transaction(() => {
           this.d.facts.insertMany(facts)
           reconcile({ db: this.d.db, facts: this.d.facts, conflicts: this.d.conflicts, clock: this.d.clock, customerId: job.customer_id, formTypes: this.d.formTypes })
           const currentFacts = this.d.facts.currentMap(job.customer_id)
@@ -2558,17 +2696,24 @@ export class Processor {
             const draft = this.d.drafts.upsertProjection(job.customer_id, ft, mapping, this.d.clock.now())
             this.d.drafts.saveBindings(draft.id, fieldBindings)
           }
+          // Fenced: false if we lost the lease. Throw to roll the whole persistence back so
+          // another worker's run is the single source of truth — never double-applied.
+          if (!this.d.lease.complete(id, lock_token)) throw new Error('lost lease')
         })
-        persist()
-
-        if (this.d.lease.complete(id, lock_token)) done++
+        // On commit failure (lost lease OR a real persistence error) back off. fail() is
+        // fenced, so a lost-lease rollback is a harmless no-op; a real error gets retried.
+        try { persistAndComplete(); done++ } catch { this.fail(id, lock_token, job.attempts, now) }
       } catch {
-        const backoff = BACKOFF_MS[Math.min(job.attempts, BACKOFF_MS.length - 1)]!
-        const next = new Date(new Date(now).getTime() + backoff).toISOString()
-        this.d.lease.fail(id, lock_token, next, this.d.maxAttempts ?? 5)
+        this.fail(id, lock_token, job.attempts, now)
       }
     }
     return done
+  }
+
+  private fail(id: string, lockToken: string, attempts: number, now: string): void {
+    const backoff = BACKOFF_MS[Math.min(attempts, BACKOFF_MS.length - 1)]!
+    const next = new Date(new Date(now).getTime() + backoff).toISOString()
+    this.d.lease.fail(id, lockToken, next, this.d.maxAttempts ?? 5)
   }
 }
 ```
@@ -2576,7 +2721,7 @@ export class Processor {
 - [ ] **Step 6: Run to verify it passes**
 
 Run: `npx vitest run tests/worker/processor.test.ts`
-Expected: PASS (2 tests).
+Expected: PASS (3 tests).
 
 - [ ] **Step 7: Commit**
 
@@ -2917,6 +3062,17 @@ resolved here:
 - **#9/#10/#11/#12/#13/#14 (LOW)** — removed the tautological review-status branch; implemented `FactsRepo.supersede`; wired `ReviewClient` + wake-on-commit in `server.ts`; surfaced `approved_blank` in `getDraft`; normalized-match returns a `null` span (not `[0,0]`); webhook dedupes by `source.id`.
 - **#7 (spec)** — the spec's "changed natural key auto-resolves via registry" overclaim was removed; a changed key now correctly yields a new item surfaced for human merge.
 - **Not built (documented):** reviewer-set `not_applicable` action (#12 setter) — `approved_blank` is surfaced read-side; the setter is a small extension listed under Deferrals.
+
+**Second review round (production-hardening) — all resolved:**
+
+- **AI SDK deps** — `package.json` pins `ai@^6` / `@ai-sdk/openai@^3` (the v6 line whose stable API is `generateText({ output: Output.object }) `); `generateObject` explicitly banned. Global Constraints note the provider-major/peer-dep rule.
+- **Outbox atomicity** — `outbox → done` and `draft → filled` now commit in **one fenced transaction** (`complete()` inside the txn, throw-to-rollback on lost lease); a crash between them can no longer strand a draft as `approved` forever. Test added.
+- **Lease claim atomicity** — `claim()` uses `BEGIN IMMEDIATE` + a **guarded per-row UPDATE** (re-checks the claimable predicate) and returns only rows whose update won, so two workers can never lease the same row.
+- **Processor idempotency** — fact/draft persistence **and** job completion commit in one transaction; a post-crash reclaim can no longer re-run `upsertProjection` and reset an approved draft. Rollback test added.
+- **Ripple cancels stale fill** — the shared-field ripple now `cancel`s the OTHER form's pending/processing outbox row before minting its new revision (+ the requested "approved 126 with pending fill, then 125 edits shared field" test).
+- **`upsertProjection` over a filled draft** now routes through `newRevision()`, always setting `superseded_by_revision` on the old row (no dangling current row). Test added.
+- **`not_applicable`** — honestly scoped: `approved_blank` sign-off is built and tested; reviewer-initiated present→N/A is documented in Explicit Scope / Deferrals, not half-implemented.
+- **`FormMapping`** widened to a recursive `JsonValue` so it can represent the real `fill_form` contract (nested `mailing_address`, `prior_carriers[]`), not just scalars.
 
 **Placeholder scan:** No TBD/TODO; every code step has complete code. The one explicit "both arms equal" branch in Task 9 is documented as intentional, not a placeholder.
 

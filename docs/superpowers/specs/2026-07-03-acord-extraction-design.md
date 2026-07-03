@@ -25,7 +25,7 @@ client class**, not a real UI.
 - **Fastify** — thin HTTP layer for the webhook.
 - **Zod** — schemas + validation (the Pydantic equivalent); also the LLM structured-output schema.
 - **LLM** — structured extraction via a provider-agnostic `LlmClient` interface. The
-  reference impl uses the Vercel AI SDK's current structured-output API —
+  reference impl uses the Vercel AI SDK **v6** structured-output API —
   `generateText({ output: Output.object({ schema }) })` (the older `generateObject` is
   deprecated in current AI SDK docs) — swappable for Vertex/Bedrock. The interface is
   mockable so the whole pipeline is testable without a live model.
@@ -273,8 +273,11 @@ The transaction does DB-only work and nothing else:
    approved it — and a later extraction could still silently flip it. **This requires a fact
    row to exist for every bound field, including blanks** — so the reconciler materializes a
    `presence: missing` (value `null`, `evidence: null`) row for any bound field a transcript
-   never mentioned. Approve-all then flips these to `approved_blank` (or the reviewer sets
-   `not_applicable`); without the materialized rows there'd be nothing to mark.
+   never mentioned. Approve-all then marks these `approved` while non-present, i.e.
+   `approved_blank`; without the materialized rows there'd be nothing to mark. (A reviewer
+   *explicitly* flipping a present field to `not_applicable` is a deferred write path — see
+   the plan's Explicit Scope / Deferrals; `approved_blank` sign-off on genuinely-blank fields
+   is built.)
 4. **Re-project** the form draft JSON from the just-approved state (persisted JSON and the
    PDF input are therefore guaranteed identical — no drift), and **persist the fresh
    `draft_field_bindings`** for this revision.
@@ -363,7 +366,15 @@ CDC (Debezium/Kafka) is both over-weight for one PDF worker and unavailable on S
   stale worker's write **no-ops** — only the current lease holder of a still-`processing` row
   can finish it. (Idempotent `fillForm` + deterministic key means even a duplicated blob
   write is harmless; fencing keeps the *state machine* correct.) The same primitive backs
-  `processing_jobs`.
+  `processing_jobs`. The **claim itself** starts with `BEGIN IMMEDIATE` (write lock taken up
+  front) and each row's UPDATE re-checks the claimable predicate, so two workers can never
+  lease the same row; only rows whose guarded UPDATE wins are returned.
+
+  The fenced completion (`outbox → done`) and the resulting `draft → filled` write commit in
+  **one transaction**: a crash between them would otherwise strand the draft `approved`
+  forever (the `done` row is never retried). Symmetrically, the `processor` commits its
+  fact/draft persistence **and** its job completion in a single transaction — so a reclaim
+  after a crash can never re-run projection over a draft a human approved in the interim.
 - **Per-row retry backoff:** on `fillForm` failure, bump `attempts` + set `next_attempt_at`
   (exponential: 5s → 30s → 2m → 10m…); the poller skips future-dated rows; dead-letter
   (`status='dead'`) after N.
