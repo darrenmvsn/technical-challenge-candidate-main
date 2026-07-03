@@ -26,9 +26,9 @@ client class**, not a real UI.
 - **Zod** — schemas + validation (the Pydantic equivalent); also the LLM structured-output schema.
 - **LLM** — structured extraction via a provider-agnostic `LlmClient` interface. The
   reference impl uses the Vercel AI SDK's current structured-output API —
-  `generateText({ output: Output.object({ schema }) })` (the older `generateObject` still
-  works and is equivalent) — swappable for Vertex/Bedrock. The interface is mockable so the
-  whole pipeline is testable without a live model.
+  `generateText({ output: Output.object({ schema }) })` (the older `generateObject` is
+  deprecated in current AI SDK docs) — swappable for Vertex/Bedrock. The interface is
+  mockable so the whole pipeline is testable without a live model.
 - **better-sqlite3** — synchronous SQLite behind a repository interface.
 - **Vitest** — unit + integration tests.
 
@@ -63,12 +63,16 @@ annual_gross_revenue: {
   presence: "present",            // see presence states below
   confidence: 0.6,
   evidence: { quote: "about two and a half million, maybe a little over", span: [1834, 1878] },
+  // evidence is null for a truly missing field — there is no quote to point at
   source_id: "src_001",
   review_status: "needs_review"   // -> "approved" once a human confirms/edits
 }
 ```
 
 "Facts" is not a separate subsystem — it is the field shape of the canonical profile.
+`evidence` is **nullable**: a `missing` field has no quote, so its evidence is `null`
+rather than an empty object (a `needs_follow_up` field may keep the deferral quote, e.g.
+"I'll get back to you").
 
 ### Presence states (a bare `null` is too vague)
 
@@ -86,6 +90,24 @@ leaving it empty (distinct from an unreviewed `missing`). Modeling reason separa
 review state is what lets the UI say "customer will follow up" vs "we forgot to ask" vs
 "human confirmed N/A" instead of a single ambiguous blank.
 
+### Collection identity (repeated objects need stable IDs)
+
+`field_path` is fine for scalars (`annual_gross_revenue`) and fixed nested objects
+(`mailing_address.street`). But **array-index paths are unstable** for the repeated
+collections — `claims`, `locations`, `prior_carriers`, `hazard_classifications`,
+`additional_insureds`, `products_schedule`. `claims[0].amount` silently rebinds if a later
+extraction reorders the list or inserts an item, which would corrupt reconciliation and
+scramble a human's per-item edits.
+
+So each repeated item gets a **stable `item_id`** and facts key on it:
+`claims.{item_id}.amount`, not `claims[0].amount`. The `item_id` is assigned on first
+extraction and **matched across transcripts by a natural key** (e.g. a claim by
+`year + type`, a prior carrier by `carrier_name`, a location by normalized address) so a
+correction in call #2 updates the *same* claim rather than appending a duplicate. When no
+confident natural-key match exists, it's treated as a new item and surfaced for review
+(merge/split is a human decision, never a silent guess). Reconciliation and the presence
+axis then operate per item-field, exactly as they do for scalars.
+
 ## Components (clean boundaries)
 
 | Module | Responsibility | Depends on |
@@ -100,7 +122,9 @@ review state is what lets the UI say "customer will follow up" vs "we forgot to 
 | `review/ReviewClient` | The TS "UI stand-in": list/get drafts, get field + provenance, `approveForm(edits?)` (one short txn) | facts + drafts + outbox repos, bindings |
 | `worker/processor` | Claims `processing_jobs` (lease): extract → reconcile → re-project drafts → needs_review; retry/dead-letter | jobs repo, extractor, reconciler |
 | `worker/outboxWorker` | Claims `outbox` (lease): wake-on-commit + adaptive backstop poll; calls `fillForm`, `approved→filled`, per-row retry backoff | outbox repo, fillForm |
-| `worker/leaseClaimer` | Shared claim primitive: atomically lease pending/expired rows with `locked_until`; reclaim on worker crash | sqlite |
+| `worker/leaseClaimer` | Shared claim primitive: atomically lease pending/expired rows with `locked_until` + fresh `lock_token`; reclaim on crash; token-fenced completion so a stale worker can't finish reclaimed work | sqlite |
+| `profile/factSelector` | Pure `selectCurrentFact(candidates)` — approval > source_date > confidence > extracted_at | — |
+| `profile/collectionIdentity` | Assign/match stable `item_id` for repeated objects (claims, locations, carriers) across transcripts by natural key | — |
 
 The LLM sits behind `LlmClient` so extraction is deterministic and testable with canned structured responses.
 
@@ -110,15 +134,18 @@ The LLM sits behind `LlmClient` so extraction is deterministic and testable with
   `checksum`, `status`) — append-only; source of truth.
 - **processing_jobs**(`id` PK, `source_id`, `customer_id`, `status`
   [`pending`|`processing`|`done`|`dead`], `attempts`, `next_attempt_at`, `locked_until`,
-  `created_at`) — durable ingest work-queue; written **in the same txn** as the source so a
-  process crash can never lose a transcript (see Durable Processing).
-- **facts**(`id` PK, `customer_id`, `field_path`, `value_json`, `presence`
-  [`present`|`missing`|`needs_follow_up`|`not_applicable`], `confidence`, `evidence_quote`,
-  `evidence_span_start`, `evidence_span_end`, `match_quality`
-  [`exact`|`normalized`|`ambiguous`|`none`], `source_id`, `extracted_at`, `review_status`
-  [`needs_review`|`approved`|`conflict`], `reviewed_value_json`, `reviewed_by`,
-  `reviewed_at`, `superseded_by`) — append-only ledger. Current value = latest
-  non-superseded row per (`customer_id`, `field_path`).
+  `lock_token`, `locked_by`, `created_at`) — durable ingest work-queue; written **in the
+  same txn** as the source so a process crash can never lose a transcript (see Durable
+  Processing). `lock_token`/`locked_by` fence stale workers (see Lease Fencing).
+- **facts**(`id` PK, `customer_id`, `field_path` (stable — `claims.{item_id}.amount`, never
+  `claims[0].amount`), `value_json`, `presence`
+  [`present`|`missing`|`needs_follow_up`|`not_applicable`], `confidence`, `evidence_quote`
+  (nullable), `evidence_span_start`, `evidence_span_end`, `match_quality`
+  [`exact`|`normalized`|`ambiguous`|`none`], `source_id`, `source_date`, `extracted_at`,
+  `review_status` [`needs_review`|`approved`|`conflict`], `reviewed_value_json`,
+  `reviewed_by`, `reviewed_at`, `superseded_by`) — append-only ledger. The **current fact**
+  per (`customer_id`, `field_path`) is chosen by an explicit selection rule
+  (see Current-Fact Selection), **not** simply the latest-inserted row.
 - **form_drafts**(`id` PK, `customer_id`, `form_type`, `revision`, `projected_json`,
   `status` [`needs_review`|`approved`|`filled`|`superseded`], `approved_by`, `approved_at`,
   `pdf_ref`, `superseded_by_revision`, `created_at`, `updated_at`) — one row **per
@@ -126,9 +153,11 @@ The LLM sits behind `LlmClient` so extraction is deterministic and testable with
   revision (see Draft Revisions). Unique current row = highest `revision` per
   (`customer_id`, `form_type`).
 - **outbox**(`id` PK, `customer_id`, `form_type`, `draft_revision`, `payload_json` (the
-  approved mapping), `status` [`pending`|`processing`|`done`|`dead`], `attempts`,
-  `next_attempt_at`, `locked_until`, `created_at`) — durable intent-to-fill; written in the
-  same transaction as the approval.
+  approved mapping), `content_hash`, `status`
+  [`pending`|`processing`|`done`|`dead`|`cancelled`], `attempts`, `next_attempt_at`,
+  `locked_until`, `lock_token`, `locked_by`, `created_at`) — durable intent-to-fill; written
+  in the same transaction as the approval. A re-approval **cancels** any still-`pending` row
+  for the same (`customer_id`, `form_type`) rather than editing it (see Re-Approval).
 - **customers**(`id` PK, `name`, `dba`, `owner`) — minimal.
 
 The append-only `facts` ledger is what enables audit + correction detection. A simpler
@@ -153,18 +182,30 @@ provided `transcripts.json` array is treated as individual sources delivered und
 
 ## Multiple / Out-of-Order / Correction Transcripts
 
-Each transcript contributes fact candidates keyed by `field_path` + `source_id`, stamped
-with the **transcript's own `date`** (not arrival time). The reconciler computes the
-current value per field:
+Each transcript contributes fact candidates keyed by (stable) `field_path` + `source_id`,
+stamped with the **transcript's own `date`** (not arrival time).
 
-1. **Human override wins.** If a field was reviewed/approved, the reviewed value is
-   current.
-2. **A newer conflicting extraction does not silently overwrite an approved value** — it
-   is recorded and the field is flagged `conflict` for re-review.
-3. Otherwise **newest `source_date` wins**; tie → **highest confidence**.
+### Current-Fact Selection
 
-Because ordering is by `source_date`, a late-arriving *older* transcript cannot clobber
-newer info, and a genuine correction in a later call supersedes the earlier value.
+The current value per field is **not** "the latest inserted row." It's an explicit,
+deterministic `selectCurrentFact(candidates)` that sorts by, in order:
+
+1. **Approval state.** A human-`approved` fact outranks any machine candidate — human
+   override always wins.
+2. **`source_date`** (newest first) — so a correction in a later call supersedes an earlier
+   value, and a late-arriving *older* transcript can't clobber newer info (arrival order is
+   irrelevant).
+3. **`confidence`** (highest) as the tie-breaker when dates are equal.
+4. **`extracted_at`** only as a final, stable deterministic tie-breaker.
+
+Making this a named pure function (not an `ORDER BY id LIMIT 1`) means selection is
+unit-testable in isolation and identical everywhere it's read.
+
+### Conflict, not silent overwrite
+
+A newer machine extraction that disagrees with an **already-approved** value does **not**
+win rule 2 — approval outranks it. Instead the field is flagged `conflict` and surfaced for
+re-review, so a human decides whether the new call actually supersedes their prior sign-off.
 
 ## Approval, Atomicity & the Outbox
 
@@ -182,17 +223,38 @@ The transaction does DB-only work and nothing else:
 
 1. **Resolve** each edit's ACORD field path → profile field path via `bindings`. An edit
    with no binding is rejected (surfaces a mapping gap rather than silently dropping).
-2. Apply resolved edits → facts get `review_status: "approved"`, `reviewed_value` /
-   `presence` set (a human may set `approved_blank`, `not_applicable`, etc.).
-3. **Re-project** the form draft JSON from the just-corrected state (persisted JSON and
+2. Apply resolved edits → those facts get `reviewed_value` / `presence` set.
+3. **Approve every field the form uses, not only the edited ones.** Approving a form is a
+   human signing off on the *whole rendered form*, so every profile fact reachable from this
+   form's bindings is marked `review_status: "approved"` (edited or not). Otherwise an
+   untouched machine value would ride onto a carrier-bound PDF without anyone having
+   approved it — and a later extraction could still silently flip it. (Fields the reviewer
+   deliberately left blank become `approved_blank` / `not_applicable`.)
+4. **Re-project** the form draft JSON from the just-approved state (persisted JSON and
    the PDF input are therefore guaranteed identical — no drift).
-4. `form_drafts.status = approved` on the current revision.
-5. Insert an **outbox** row (`pending`) carrying the approved mapping + `draft_revision`.
-6. **Commit.**
+5. **Supersede any in-flight fill.** If a still-`pending` outbox row exists for this
+   (`customer_id`, `form_type`), mark it `cancelled` and open a **new draft revision** —
+   never edit the pending row in place (see Re-Approval). Set `form_drafts.status = approved`
+   on the current revision.
+6. Insert a fresh **outbox** row (`pending`) carrying the approved mapping + `draft_revision`
+   + `content_hash`.
+7. **Commit.**
 
 Bindings are bidirectional and the single source of truth for the DRY overlap: two form
 entries pointing at the same `profileFieldPath` *are* the definition of a shared field.
 Renderers walk the map forward; `approveForm` walks it in reverse.
+
+### Re-Approval (a pending fill already exists)
+
+If the form is re-approved while its previous fill is still `pending` (worker hasn't run
+yet) or already `filled`, we must not mutate the outstanding work in place — that would race
+the worker or corrupt an immutable artifact. Instead:
+
+- **Pending fill:** `cancel` the pending outbox row and enqueue a new one on a new revision.
+  The cancelled row is skipped by the worker (or, if the worker already leased it, its stale
+  completion is fenced off — see Lease Fencing), so exactly one fill wins.
+- **Filled already:** leave the `filled` row + PDF immutable; the re-approval lands on a new
+  revision with its own outbox row (consistent with the shared-field ripple rule).
 
 ### Why an outbox and not a synchronous `fillForm`
 
@@ -219,13 +281,21 @@ CDC (Debezium/Kafka) is both over-weight for one PDF worker and unavailable on S
 - **Adaptive backstop poll:** only a durability net for signals lost to a crash/restart.
   Drain when kicked; when a poll finds nothing, back off (~1s → ~30s ceiling), snap back on
   work. It exists so a crash can't strand an approved form, not to notice normal approvals.
-- **Claim a batch atomically, with lease recovery:** claim rows that are `pending` **or**
-  whose lease has expired —
-  `UPDATE outbox SET status='processing', locked_until=? WHERE (status='pending' OR
-  (status='processing' AND locked_until < now)) AND next_attempt_at <= now LIMIT n`. The
-  `locked_until` visibility timeout means a **worker that crashes mid-`fillForm` doesn't
-  strand its rows** — the lease expires and another claim reclaims them. (Idempotent
-  `fillForm` makes that reclaim safe.) The same primitive backs `processing_jobs`.
+- **Claim a batch atomically, with lease recovery + fencing:** each claim stamps a fresh
+  **`lock_token`** (and `locked_by`) and a `locked_until`, claiming rows that are `pending`
+  **or** lease-expired —
+  `UPDATE outbox SET status='processing', locked_until=?, lock_token=?, locked_by=? WHERE
+  (status='pending' OR (status='processing' AND locked_until < now)) AND next_attempt_at <=
+  now LIMIT n`. The `locked_until` timeout means a **worker that crashes mid-`fillForm`
+  doesn't strand its rows** — the lease expires and another claim reclaims them.
+- **Lease fencing (an expired-but-alive slow worker):** reclaim alone isn't enough — a slow
+  worker whose lease expired could wake up and complete *stale* work over the row a new
+  worker now owns. So every completion/failure write is **guarded by the token**:
+  `UPDATE outbox SET status='done' WHERE id=? AND lock_token=?`. If the row was reclaimed,
+  the token no longer matches and the stale worker's write **no-ops** — only the current
+  lease holder can finish the row. (Idempotent `fillForm` + deterministic key means even a
+  duplicated blob write is harmless; fencing keeps the *state machine* correct.) The same
+  primitive backs `processing_jobs`.
 - **Per-row retry backoff:** on `fillForm` failure, bump `attempts` + set `next_attempt_at`
   (exponential: 5s → 30s → 2m → 10m…); the poller skips future-dated rows; dead-letter
   (`status='dead'`) after N.
@@ -277,8 +347,8 @@ a **statically-typed object only if it passes**, else retry, else throw.
 
 - **Pydantic AI** — `output_type=Model`; defaults to tool-output (also `NativeOutput` /
   `PromptedOutput`); Pydantic validation; built-in output retries (`ModelRetry`).
-- **AI SDK + Zod** — `generateText({ output: Output.object({ schema }) })` (or the
-  equivalent `generateObject`); native/tool structured output; Zod validation; throws on
+- **AI SDK + Zod** — `generateText({ output: Output.object({ schema }) })` (the older
+  `generateObject` is deprecated); native/tool structured output; Zod validation; throws on
   invalid output.
 
 We hide the difference behind the **`LlmClient` interface** and wrap the call with
@@ -336,13 +406,19 @@ The extractor must handle messy speech and prefer flagging over inventing precis
 ## Testing Strategy
 
 - **Unit:** bindings (forward projection + reverse edit-resolution, shared-field overlap),
-  renderers, reconciler (corrections, out-of-order, human-edit protection, presence states),
-  extractor with mocked `LlmClient`, evidence matcher (exact/normalized/ambiguous/none →
-  `needs_review`), `ReviewClient`.
-- **Workers / lease:** claim primitive leases pending + reclaims lease-expired rows; retry
+  renderers, `selectCurrentFact` (approval > source_date > confidence, out-of-order arrival,
+  approved-beats-newer-machine → `conflict`), collection identity (same claim matched across
+  transcripts by natural key; unmatched → new item), reconciler (presence states), extractor
+  with mocked `LlmClient`, evidence matcher (exact/normalized/ambiguous/none → `needs_review`;
+  missing → null evidence), `ReviewClient`.
+- **Approval semantics:** `approveForm` marks **every** form-bound fact approved (not just
+  edits); a subsequent machine extraction cannot silently flip an approved field.
+- **Re-approval:** re-approving with a `pending` outbox row `cancel`s it + opens a new
+  revision (no in-place edit); re-approving a `filled` form lands on a new revision.
+- **Workers / lease + fencing:** claim leases pending + reclaims lease-expired rows; retry
   backoff + dead-letter; idempotent re-delivery (same deterministic key → no dup);
-  wake-on-commit vs backstop-poll paths. Simulate a mid-flight "crash" (drop the lease) and
-  assert reclaim.
+  wake-on-commit vs backstop-poll. Simulate a mid-flight "crash" → assert reclaim; simulate
+  an **expired slow worker** completing with a stale `lock_token` → assert its write no-ops.
 - **Durability:** a source + `processing_jobs` row committed together; "restart" (new worker
   instance) re-claims the pending job and completes it.
 - **Revisions:** shared edit against a `filled` ACORD 126 creates a new `needs_review`
@@ -355,18 +431,19 @@ The extractor must handle messy speech and prefer flagging over inventing precis
 
 ## Prototype Build Order
 
-1. Schemas: `BusinessProfile` (Zod), fact shape (value + presence + confidence + evidence + match_quality), form field types.
-2. Storage: sqlite repos (sources, processing_jobs, facts, drafts, outbox) + blob store + shared **lease-claim primitive**.
+1. Schemas: `BusinessProfile` (Zod), fact shape (value + presence + nullable evidence + confidence + match_quality + stable `field_path`), form field types.
+2. Storage: sqlite repos (sources, processing_jobs, facts, drafts, outbox) + blob store + shared **lease-claim primitive with token fencing**.
 3. `forms/bindings` — the bidirectional `(formType, formFieldPath) ↔ profileFieldPath` map (foundation for renderers *and* approve).
-4. Extractor + `LlmClient` interface (+ bounded retry) + mock; evidence matcher (exact/normalized/ambiguous/none).
-5. Reconciler (the reducer + conflict detection + presence states).
-6. Form renderers (125, 126) driven by bindings — the DRY payoff.
-7. Processor as a `processing_jobs` claimant (durable ingest).
-8. `fillForm` stub + deterministic blob key.
-9. `ReviewClient.approveForm` (reverse-binding resolution; short txn: edits + approval + outbox row) + revision-based shared-field ripple.
-10. Outbox worker (wake-on-commit + adaptive backstop poll + lease recovery + per-row retry backoff).
-11. Webhook (Fastify) writing source + job in one txn.
-12. Tests throughout.
+4. `selectCurrentFact` + `collectionIdentity` (stable `item_id` matching) — pure, unit-tested first.
+5. Extractor + `LlmClient` interface (+ bounded retry) + mock; evidence matcher (exact/normalized/ambiguous/none; missing → null).
+6. Reconciler (candidates → current facts via `selectCurrentFact`, presence states, conflict flagging).
+7. Form renderers (125, 126) driven by bindings — the DRY payoff.
+8. Processor as a token-fenced `processing_jobs` claimant (durable ingest).
+9. `fillForm` stub + deterministic blob key.
+10. `ReviewClient.approveForm` (reverse-binding resolution; approve **all** form-bound facts; supersede pending fill; short txn) + revision-based ripple.
+11. Outbox worker (wake-on-commit + adaptive backstop poll + lease recovery + token fencing + per-row retry backoff).
+12. Webhook (Fastify) writing source + job in one txn.
+13. Tests throughout.
 
 ## Alternatives Considered
 
