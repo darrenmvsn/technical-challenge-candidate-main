@@ -8,13 +8,25 @@ export type ReviewStatus = 'needs_review' | 'approved' | 'conflict'
 export type MatchQuality = 'exact' | 'normalized' | 'ambiguous' | 'none'
 export type FormType = 'acord_125' | 'acord_126'
 
-/** One extracted field: value + why-it-is/isn't-there + confidence + provenance quote. */
+/**
+ * One extracted field: value + why-it-is/isn't-there + confidence + provenance quote.
+ * Invariant #6: `evidence` is `null` ONLY for `presence === 'missing'`. A cross-field
+ * `superRefine` rejects a present/needs_follow_up/not_applicable field with null evidence,
+ * and rejects a missing field carrying evidence — so the constraint can't be silently violated.
+ */
 export function envelopeField<T extends z.ZodTypeAny>(value: T) {
   return z.object({
     value: value.nullable(),
     presence: Presence,
     confidence: z.number().min(0).max(1),
-    evidence: z.string().nullable(), // null for a truly missing field
+    evidence: z.string().nullable(), // null ONLY for a truly missing field (enforced below)
+  }).superRefine((field, ctx) => {
+    if (field.presence === 'missing' && field.evidence !== null) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['evidence'], message: "evidence must be null when presence is 'missing'" })
+    }
+    if (field.presence !== 'missing' && field.evidence === null) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['evidence'], message: "evidence is required unless presence is 'missing'" })
+    }
   })
 }
 export type EnvelopeField<T> = { value: T | null; presence: Presence; confidence: number; evidence: string | null }
