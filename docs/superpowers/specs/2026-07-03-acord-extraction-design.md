@@ -486,8 +486,9 @@ The extractor must handle messy speech and prefer flagging over inventing precis
   reorders the array → assert the edit still resolved to the original claim's `item_id` via
   the persisted `draft_field_bindings`.
 - **Idempotent item_id:** reprocess the *same* source twice → no duplicate collection items,
-  same `item_id` (deterministic id + `collection_items` registry); a corrected natural key
-  still resolves to the existing item.
+  same `item_id` (deterministic id + `collection_items` registry). A **re-seen identical**
+  natural key resolves to the existing item; a **changed** natural key mints a new item
+  surfaced for human merge (we do not fuzzy-re-identify).
 - **Approval semantics:** `approveForm` marks **every** form-bound fact approved (incl.
   materialized `presence: missing` rows → `approved_blank`); a subsequent machine extraction
   cannot silently flip an approved field.

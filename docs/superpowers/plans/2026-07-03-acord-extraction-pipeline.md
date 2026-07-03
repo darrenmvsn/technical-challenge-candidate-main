@@ -886,8 +886,9 @@ import type { CollectionItemsRepo } from '../db/repos/collectionItems.js'
 import { itemIdFor } from '../util/hash.js'
 
 /**
- * Deterministic id (idempotent under reprocessing) + registry lookup so a weak/changing
- * natural key still resolves to the existing item.
+ * Deterministic id (idempotent under reprocessing) + registry lookup: a re-seen IDENTICAL
+ * natural key resolves to the existing item. A CHANGED natural key misses the registry and
+ * mints a new item (surfaced for human merge) — we do not fuzzy-re-identify.
  */
 export function resolveItemId(
   repo: CollectionItemsRepo, clock: Clock,
@@ -1221,7 +1222,7 @@ git commit -m "feat: staged evidence matcher (exact/normalized/ambiguous/none)"
 - Test: `tests/extraction/extractor.test.ts`
 
 **Interfaces:**
-- Consumes: `ExtractionEnvelope`, `Fact`, `EnvelopeField` (Task 2); `locateEvidence` (Task 8); `resolveItemId` (Task 6); `Clock`, `newId` (Task 1).
+- Consumes: `ExtractionEnvelope`, `Fact`, `EnvelopeField` (Task 2); `locateEvidence` (Task 8); `resolveItemId` (Task 6); `Clock`, `factIdFor` (Task 1).
 - Produces:
   - `interface LlmClient { extract(transcript: string): Promise<ExtractionEnvelope> }`.
   - `class MockLlmClient implements LlmClient` (constructed with a canned envelope).
@@ -1462,7 +1463,7 @@ git commit -m "feat: LlmClient (mock+aisdk) and fact extractor"
 - Test: `tests/profile/reconciler.test.ts`
 
 **Interfaces:**
-- Consumes: `DB`, `Fact` (Task 2), `selectCurrentFact` (Task 5), `boundScalarPaths` (Task 7), `Clock`, `newId`.
+- Consumes: `DB`, `Fact` (Task 2), `selectCurrentFact` (Task 5), `boundScalarPaths` (Task 7), `Clock`, `factIdFor` (Task 1).
 - Produces:
   - `class FactsRepo { insertMany(facts: Fact[]): void; byField(customerId, fieldPath): Fact[]; currentMap(customerId): Map<string,Fact>; allFieldPaths(customerId): string[]; markApproved(id, value, by, at): void; supersede(id, by): void }`.
   - `class ConflictsRepo { insert(...); listUnresolved(customerId): ConflictRow[]; resolve(id, by, at): void }`.
@@ -2593,7 +2594,7 @@ git commit -m "feat: durable ingest processor (extract+reconcile+project)"
 - Test: `tests/ingest/webhook.test.ts`
 
 **Interfaces:**
-- Consumes: Fastify, `insertSourceAndJob`, `SourcesRepo` (dedupe by checksum), `contentHash`, `newId`, `Clock`, and a `wake()` callback for the processor.
+- Consumes: Fastify, `insertSourceAndJob`, `SourcesRepo` (dedupe by `source.id` or checksum), `contentHash`, `newId`, `Clock`, and a `wake()` callback for the processor.
 - Produces: `buildWebhookApp(deps): FastifyInstance` with `POST /webhook/transcript` accepting `{ customer_id, source: { id, type, date, content } }`; persists source+job in one txn, returns `202 { job_id }`; deduplicates a re-delivered source by checksum (returns `200 { deduped: true }`).
 
 - [ ] **Step 1: Write the failing test**
