@@ -1,0 +1,9 @@
+{
+  "policyholder_first_name": { "value": "Mike", "presence": "present", "confidence": 0.95, "evidence": "My name's Mike Torres" },
+  "annual_gross_revenue": { "value": 2500000, "presence": "present", "confidence": 0.5, "evidence": "about two and a half million, maybe a little over" },
+  "annual_payroll": { "value": null, "presence": "needs_follow_up", "confidence": 0.2, "evidence": "can I get back to you on that" },
+  "employee_count_full_time": { "value": 35, "presence": "present", "confidence": 0.7, "evidence": "roughly 35 full-time guys" },
+  "claims": [
+    { "natural_key": "2023|workers_comp", "year": { "value": 2023, "presence": "present", "confidence": 0.6, "evidence": "fell off a ladder" }, "type": { "value": "workers_comp", "presence": "present", "confidence": 0.8, "evidence": "workers comp claim" }, "amount": { "value": 30000, "presence": "present", "confidence": 0.7, "evidence": "about $30,000" }, "description": { "value": "Crew lead fell off ladder, broke arm", "presence": "present", "confidence": 0.6, "evidence": "broke his arm pretty bad" } }
+  ]
+}
