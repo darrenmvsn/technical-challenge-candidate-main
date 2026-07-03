@@ -195,6 +195,41 @@ Forms are projections of one profile, so editing a **shared** field (e.g.
 An already-approved/filled ACORD 126 is therefore bumped back to `needs_review` (flagged),
 never silently overwritten. Approval stays per-form; shared edits ripple as **re-review**.
 
+## Extraction Contract (stack-agnostic)
+
+The LLM fills the **domain model** (`BusinessProfile`), never ACORD field names — form
+field names are applied by the renderers, so a form rename is a compile error, not model
+drift.
+
+The schema is an **envelope**, not bare values — each field is
+`{ value: T | null, confidence: number, evidence: string }`, with `null` meaning
+*not stated, do not guess*, and enums (e.g. `entity_type`) constraining the model to valid
+values. This carries the provenance and confidence the review step needs.
+
+**The core pattern is identical across libraries:** give the model a schema →
+constrained/guided generation for shape → **validate the result at runtime** → hand the app
+a **statically-typed object only if it passes**, else retry, else throw.
+
+- **Pydantic AI** — `output_type=Model`; defaults to tool-output (also `NativeOutput` /
+  `PromptedOutput`); Pydantic validation; built-in output retries (`ModelRetry`).
+- **AI SDK + Zod** — `schema: ZodType`; native/tool structured output; Zod validation;
+  throws on invalid output.
+
+We hide the difference behind the **`LlmClient` interface** and wrap the call with
+**bounded retries**, so app-level behaviour is the same either way (and the whole design
+ports to Python/Pydantic AI unchanged — swap Zod→Pydantic, `generateObject`→`Agent`).
+
+**Two things this guarantees, and one it does not:**
+- Runtime validation makes the static type **sound for shape** — past the single
+  parse-at-boundary point, the reconciler, renderers, and `ReviewClient` trust their inputs.
+- **Evidence spans are computed in code, not trusted from the model** — the model returns a
+  verbatim quote; we `indexOf` it in the transcript for the `[start,end]` span. Quote not
+  found → downgrade the field to low-confidence / `needs_review` (paraphrase = hallucination
+  signal).
+- **Schema validation proves shape, not truth.** A hallucinated-but-valid `number` still
+  passes. Correctness of *values* rests on provenance, evidence spans, confidence, and the
+  human approval gate — never on the schema alone.
+
 ## Extraction Judgment (from the sample transcript)
 
 The extractor must handle messy speech and prefer flagging over inventing precision:
