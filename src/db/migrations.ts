@@ -1,0 +1,109 @@
+/**
+ * All CREATE TABLE / CREATE INDEX DDL for the ACORD extraction pipeline (spec's Data
+ * Model). Every statement is idempotent (`IF NOT EXISTS`) so `migrate()` is safe to
+ * re-run against an existing DB.
+ *
+ * Finite-state columns carry a `CHECK` constraint (AGENTS.md invariant #11) mirroring the
+ * enums in `src/schema/profile.ts` / `src/schema/forms.ts`:
+ *   - facts.presence        -> presenceValues
+ *   - facts.match_quality   -> MatchQuality
+ *   - facts.review_status   -> ReviewStatus
+ *   - processing_jobs.status -> pending|processing|done|dead
+ *   - outbox.status          -> pending|processing|done|dead|cancelled
+ *   - form_drafts.status     -> needs_review|approved|filled
+ *   - form_drafts.form_type / outbox.form_type -> FormType
+ *   - conflicts.status       -> unresolved|resolved
+ *
+ * `sources.status` and `collection_items.collection` are intentionally left unconstrained:
+ * the spec never defines a closed set for either (sources.status is always written as
+ * 'received'; collections are an open, mechanically-extensible set per the scope
+ * guardrails) — inventing enum values for them would be speculative, not spec-derived.
+ *
+ * Queue/current-read hot paths get supporting indexes: job/outbox claim queries filter on
+ * (status, next_attempt_at); the "current fact"/"current draft" reads filter on
+ * (customer_id, field_path/form_type, superseded_by/superseded_by_revision); conflict
+ * listing filters on (customer_id, status); source dedup checks by checksum.
+ */
+export const DDL = `
+CREATE TABLE IF NOT EXISTS customers (
+  id TEXT PRIMARY KEY, name TEXT, dba TEXT, owner TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sources (
+  id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, type TEXT NOT NULL,
+  source_date TEXT NOT NULL, received_at TEXT NOT NULL, raw_json TEXT NOT NULL,
+  checksum TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'received'
+);
+CREATE INDEX IF NOT EXISTS idx_sources_checksum ON sources(checksum);
+
+CREATE TABLE IF NOT EXISTS processing_jobs (
+  id TEXT PRIMARY KEY, source_id TEXT NOT NULL, customer_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','processing','done','dead')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL, locked_until TEXT, lock_token TEXT, locked_by TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_claim ON processing_jobs(status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS facts (
+  id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, field_path TEXT NOT NULL,
+  value_json TEXT,
+  presence TEXT NOT NULL
+    CHECK (presence IN ('present','missing','needs_follow_up','not_applicable')),
+  confidence REAL NOT NULL,
+  evidence_quote TEXT, evidence_span_start INTEGER, evidence_span_end INTEGER,
+  match_quality TEXT NOT NULL
+    CHECK (match_quality IN ('exact','normalized','ambiguous','none')),
+  source_id TEXT NOT NULL, source_date TEXT NOT NULL,
+  extracted_at TEXT NOT NULL,
+  review_status TEXT NOT NULL DEFAULT 'needs_review'
+    CHECK (review_status IN ('needs_review','approved','conflict')),
+  reviewed_value_json TEXT, reviewed_by TEXT, reviewed_at TEXT, superseded_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_facts_current ON facts(customer_id, field_path, superseded_by);
+
+CREATE TABLE IF NOT EXISTS collection_items (
+  id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, collection TEXT NOT NULL,
+  natural_key TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(customer_id, collection, natural_key)
+);
+
+CREATE TABLE IF NOT EXISTS form_drafts (
+  id TEXT PRIMARY KEY, customer_id TEXT NOT NULL,
+  form_type TEXT NOT NULL CHECK (form_type IN ('acord_125','acord_126')),
+  revision INTEGER NOT NULL, projected_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'needs_review'
+    CHECK (status IN ('needs_review','approved','filled')),
+  approved_by TEXT, approved_at TEXT,
+  pdf_ref TEXT, superseded_by_revision INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(customer_id, form_type, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_form_drafts_current ON form_drafts(customer_id, form_type, superseded_by_revision);
+
+CREATE TABLE IF NOT EXISTS draft_field_bindings (
+  draft_id TEXT NOT NULL, form_field_path TEXT NOT NULL, profile_field_path TEXT NOT NULL,
+  PRIMARY KEY (draft_id, form_field_path)
+);
+
+CREATE TABLE IF NOT EXISTS outbox (
+  id TEXT PRIMARY KEY, customer_id TEXT NOT NULL,
+  form_type TEXT NOT NULL CHECK (form_type IN ('acord_125','acord_126')),
+  draft_revision INTEGER NOT NULL, payload_json TEXT NOT NULL, content_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','processing','done','dead','cancelled')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL, locked_until TEXT, lock_token TEXT, locked_by TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_claim ON outbox(status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS conflicts (
+  id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, field_path TEXT NOT NULL,
+  current_fact_id TEXT NOT NULL, conflicting_fact_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'unresolved'
+    CHECK (status IN ('unresolved','resolved')),
+  resolved_by TEXT, resolved_at TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conflicts_customer_status ON conflicts(customer_id, status);
+`
