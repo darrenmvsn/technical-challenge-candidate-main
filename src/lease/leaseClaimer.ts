@@ -98,30 +98,29 @@ export class LeaseClaimer {
   }
 
   /**
-   * Record a failed attempt: token-fenced read of the current attempt count, then bump
-   * attempts and either dead-letter (attempts+1 >= maxAttempts) or re-queue as pending
-   * with the given backoff `nextAttemptAt`. Returns `false` (lease already lost) when
-   * the fenced read finds no matching row — the row is left untouched in that case.
+   * Record a failed attempt in a SINGLE token-fenced write. The UPDATE bumps `attempts`
+   * in-place (`attempts + 1`) and dead-letters when that lands at/above `maxAttempts`,
+   * else re-queues as pending with the given backoff `nextAttemptAt`. It clears the
+   * lease. `RETURNING attempts` lets us both derive the new status from the incremented
+   * value and detect whether the fence actually matched a row.
+   *
+   * Returns `false` (lease already lost — stale/wrong token, or row no longer
+   * `processing`) when the fenced write matches 0 rows, so a lost lease is surfaced, not
+   * silently reported as a successful failure-recording. No check-then-write TOCTOU: the
+   * status/attempts decision is expressed in SQL, evaluated atomically inside the write.
    */
   fail(id: string, lockToken: string, nextAttemptAt: string, maxAttempts: number): boolean {
-    const tx = this.db.transaction(() => {
-      const row = this.db
-        .prepare(`SELECT attempts FROM ${this.table} WHERE id = ? AND lock_token = ? AND status = 'processing'`)
-        .get(id, lockToken) as { attempts: number } | undefined
-      if (!row) return false
-
-      const attempts = row.attempts + 1
-      const status = attempts >= maxAttempts ? 'dead' : 'pending'
-      this.db
-        .prepare(
-          `UPDATE ${this.table}
-           SET status = @status, attempts = @attempts, next_attempt_at = @next,
-               locked_until = NULL, lock_token = NULL
-           WHERE id = @id AND lock_token = @lockToken AND status = 'processing'`
-        )
-        .run({ id, lockToken, status, attempts, next: nextAttemptAt })
-      return true
-    })
-    return tx()
+    const updated = this.db
+      .prepare(
+        `UPDATE ${this.table}
+         SET attempts = attempts + 1,
+             status = CASE WHEN attempts + 1 >= @maxAttempts THEN 'dead' ELSE 'pending' END,
+             next_attempt_at = @next,
+             locked_until = NULL, lock_token = NULL
+         WHERE id = @id AND lock_token = @lockToken AND status = 'processing'
+         RETURNING attempts`
+      )
+      .get({ id, lockToken, next: nextAttemptAt, maxAttempts }) as { attempts: number } | undefined
+    return updated !== undefined
   }
 }

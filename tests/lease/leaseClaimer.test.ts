@@ -83,7 +83,7 @@ describe('LeaseClaimer', () => {
     expect(db.prepare("SELECT status FROM outbox WHERE id='o1'").get()).toMatchObject({ status: 'dead' })
   })
 
-  it('fail() re-queues as pending with backoff when attempts remain below max', () => {
+  it('fail() with the correct token re-queues as pending with backoff and increments attempts', () => {
     seedOutbox(db, 'o1')
     const [c] = lease.claim('2025-01-02T00:00:00Z', 30_000, 'w1', 10)
     expect(lease.fail('o1', c!.lock_token, '2025-01-02T00:05:00Z', 5)).toBe(true)
@@ -91,18 +91,34 @@ describe('LeaseClaimer', () => {
     expect(row).toMatchObject({ status: 'pending', attempts: 1, next_attempt_at: '2025-01-02T00:05:00Z', lock_token: null })
   })
 
-  it('fail() with a stale token affects nothing and returns false (lease already lost)', () => {
+  it('fail() with a wrong/stale token surfaces the 0-row fence as false and mutates nothing', () => {
     seedOutbox(db, 'o1')
     lease.claim('2025-01-02T00:00:00Z', 30_000, 'w1', 10)
-    expect(lease.fail('o1', 'stale-token', '2025-01-02T00:05:00Z', 5)).toBe(false)
-    expect(db.prepare("SELECT status FROM outbox WHERE id='o1'").get()).toMatchObject({ status: 'processing' })
+    const before = db.prepare("SELECT status, attempts, next_attempt_at FROM outbox WHERE id='o1'").get()
+    expect(lease.fail('o1', 'wrong-token', '2025-01-02T00:05:00Z', 5)).toBe(false)
+    // status still processing, attempts NOT incremented, next_attempt_at untouched.
+    expect(db.prepare("SELECT status, attempts, next_attempt_at FROM outbox WHERE id='o1'").get()).toEqual(before)
+    expect(before).toMatchObject({ status: 'processing', attempts: 0 })
+  })
+
+  it('fail() no-ops (false) once the row is no longer processing', () => {
+    seedOutbox(db, 'o1')
+    const [c] = lease.claim('2025-01-02T00:00:00Z', 30_000, 'w1', 10)
+    db.prepare("UPDATE outbox SET status='cancelled' WHERE id='o1'").run()
+    expect(lease.fail('o1', c!.lock_token, '2025-01-02T00:05:00Z', 5)).toBe(false)
+    expect(db.prepare("SELECT status, attempts FROM outbox WHERE id='o1'").get()).toMatchObject({ status: 'cancelled', attempts: 0 })
   })
 
   it('rejects a table name outside the closed lease-table allowlist', () => {
     expect(() => new LeaseClaimer(db, 'users' as unknown as 'outbox')).toThrow() // deliberate invalid-table injection to prove the allowlist guard
   })
 
-  describe('cross-connection concurrency (hard case)', () => {
+  // NOTE: better-sqlite3 is synchronous, so these two-connection tests are sequential, not
+  // truly concurrent — connection A's transaction fully commits before B's begins. They do
+  // NOT exercise BEGIN IMMEDIATE lock contention or interleaving. What they DO prove: across
+  // two separate on-disk connections, a claim committed by A is visible to B, and B's guarded
+  // UPDATE re-checks the claimable predicate so it excludes a row A has already claimed.
+  describe('cross-connection committed-visibility (guarded UPDATE excludes already-claimed rows)', () => {
     let dir: string
     let filePath: string
     let dbA: DB
@@ -122,7 +138,7 @@ describe('LeaseClaimer', () => {
       rmSync(dir, { recursive: true, force: true })
     })
 
-    it('exactly one of two separate connections wins the claim on the same pending row', () => {
+    it('a second connection does not re-claim a row the first connection already committed a claim on', () => {
       seedOutbox(dbA, 'o1')
       const leaseA = new LeaseClaimer(dbA, 'outbox')
       const leaseB = new LeaseClaimer(dbB, 'outbox')
@@ -138,7 +154,7 @@ describe('LeaseClaimer', () => {
       ).toMatchObject({ lock_token: winnerToken })
     })
 
-    it('two connections split a multi-row batch with no overlap and no double-claims', () => {
+    it('a second connection claims only the rows the first left unclaimed (no overlap)', () => {
       seedOutbox(dbA, 'o1')
       seedOutbox(dbA, 'o2')
       seedOutbox(dbA, 'o3')
