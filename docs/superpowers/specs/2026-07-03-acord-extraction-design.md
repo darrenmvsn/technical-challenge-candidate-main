@@ -134,8 +134,8 @@ human. The registry guarantees *stability*, not *fuzzy re-identification*.
 | `extraction/extractor` | transcript(s) → Zod-validated facts w/ provenance + confidence | `LlmClient` |
 | `profile/reconciler` | Merge candidates via `selectCurrentFact`; **materialize `presence: missing` rows for every form-bound field**; write `conflicts` rows when a newer candidate disagrees with an approved fact | facts repo, factSelector, bindings |
 | `forms/bindings` | Static `(formType, formFieldPath) ↔ profileFieldPath` map for scalar/fixed fields | — |
-| `forms/renderers` | Pure `profile → { mapping, fieldBindings }` projections for 125 & 126; emit the concrete **per-draft** binding rows (incl. array `claims[i] → claims.{item_id}`) alongside the mapping | bindings |
-| `forms/fillForm` | Stub: `(formType, mapping) → bytes`; writes to blob store at a deterministic key | blob store |
+| `forms/renderers` | Pure `profile → { mapping, fieldBindings }` projections (the **flat** review mapping) for 125 & 126, emitting the concrete **per-draft** binding rows (incl. array `claims[i] → claims.{item_id}`); plus `toFillMapping` which unflattens that into the **nested** `fill_form` contract shape | bindings |
+| `forms/fillForm` | Stub: `(formType, nestedMapping) → bytes`; writes to blob store at a deterministic key | blob store |
 | `review/ReviewClient` | The TS "UI stand-in": list/get drafts, get field + provenance, `listUnresolvedConflicts`, `resolveConflict`, `approveForm(edits?)` (one short txn) | facts + drafts + outbox + conflicts repos, bindings |
 | `worker/processor` | Claims `processing_jobs` (lease): extract → reconcile → re-project drafts → needs_review; retry/dead-letter | jobs repo, extractor, reconciler |
 | `worker/outboxWorker` | Claims `outbox` (lease): wake-on-commit + adaptive backstop poll; calls `fillForm`, `approved→filled`, per-row retry backoff | outbox repo, fillForm |
@@ -179,7 +179,8 @@ The LLM sits behind `LlmClient` so extraction is deterministic and testable with
   [`claims`|`locations`|`prior_carriers`|…], `natural_key`, `created_at`) — registry that
   makes `item_id` **idempotent across reprocessing** (see Collection Identity).
 - **outbox**(`id` PK, `customer_id`, `form_type`, `draft_revision`, `payload_json` (the
-  approved mapping), `content_hash`, `status`
+  approved mapping in the **nested `fill_form` shape**, not the flat review mapping),
+  `content_hash`, `status`
   [`pending`|`processing`|`done`|`dead`|`cancelled`], `attempts`, `next_attempt_at`,
   `locked_until`, `lock_token`, `locked_by`, `created_at`) — durable intent-to-fill; written
   in the same transaction as the approval. A re-approval **cancels** any still-`pending` row
@@ -287,8 +288,10 @@ The transaction does DB-only work and nothing else:
    `filled`):* `cancel` the outstanding outbox row, set `superseded_by_revision` on the prior
    draft, and create a **new revision** with `status = approved` — never edit the outstanding
    row in place (see Re-Approval).
-6. Insert a fresh **outbox** row (`pending`) carrying the approved mapping + `draft_revision`
-   + `content_hash`.
+6. Insert a fresh **outbox** row (`pending`) carrying the approved mapping — converted via
+   `toFillMapping` to the **nested `fill_form` shape** — plus `draft_revision` +
+   `content_hash` (computed over that nested mapping, so it matches `fillForm`'s blob key).
+   The draft keeps the flat mapping; only the outbox payload is nested.
 7. **Commit.**
 
 Bindings are the single source of truth for the DRY overlap: two form entries pointing at
@@ -309,6 +312,26 @@ When a reviewer edits `claims[0].amount`, `approveForm` reverse-resolves through
 **persisted per-draft binding** (not the static map) to reach the right item's fact — so an
 edit lands on the intended claim even if a later re-extraction would reorder the array.
 Scalars still use the static map; only array-element paths need the per-draft rows.
+
+### Flat review mapping vs nested fill mapping
+
+The renderer emits **one flat mapping** keyed by dotted/bracketed ACORD paths
+(`mailing_address.street`, `claims[0].amount`). That flatness is deliberate — it is the shape
+the human review layer wants: every reviewable field is one addressable key, provenance and
+edits attach per key, `form_drafts.projected_json` stores it directly, and reverse-edit
+resolution (`reverseResolve`) looks fields up by that same flat path. A nested object would
+force the review UI and edit resolver to walk into sub-objects and array indices for every
+field.
+
+The real `fill_form` service, however, wants the **nested** contract shape from the README —
+`{ mailing_address: { street, … }, claims: [ { amount, … } ] }`. So at approve time a pure
+`toFillMapping` unflattens the flat mapping into that nested shape: dotted segments become
+nested objects, `claims[i].field` becomes a dense, ordered array of objects. The nested result
+is what we persist as the outbox `payload_json` and hand to `fillForm`; the flat mapping stays
+the human-facing surface. Both derive deterministically from the same approved facts, so they
+never drift. The `content_hash` is computed over the **nested** mapping so the value stored on
+the outbox row equals the content-addressed blob key `fillForm` derives — one hash identifies
+the actual artifact produced.
 
 ### Re-Approval (a pending fill already exists)
 

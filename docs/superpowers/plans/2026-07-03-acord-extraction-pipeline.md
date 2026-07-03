@@ -75,7 +75,7 @@ src/
   profile/collectionIdentity.ts resolveItemId()
   profile/reconciler.ts        reconcile(): candidates -> current facts + conflicts + missing rows
   forms/bindings.ts            static (formType,formFieldPath)<->profileFieldPath
-  forms/renderers.ts           render125/render126 -> { mapping, fieldBindings }
+  forms/renderers.ts           renderForm -> flat { mapping, fieldBindings }; toFillMapping -> nested fill_form shape
   forms/fillForm.ts            fillForm() stub
   blob/blobStore.ts            put()/get() against a local dir
   extraction/llmClient.ts      LlmClient interface + AiSdkLlmClient + MockLlmClient
@@ -415,8 +415,23 @@ export type { FormType }
  */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue }
 
-/** A rendered form: ACORD field name -> JSON value (scalar, nested object, or array). */
+/**
+ * FLAT review mapping: ACORD field name -> JSON value, keyed by dotted/bracketed paths
+ * (`mailing_address.street`, `claims[0].amount`). This is the human-facing surface — the
+ * review UI iterates these keys, edits are resolved against them, `form_drafts.projected_json`
+ * stores this, and field bindings key off it. It is NOT the shape the PDF service consumes.
+ */
 export type FormMapping = Record<string, JsonValue>
+
+/**
+ * NESTED fill mapping: the exact shape the real `fill_form` service consumes (see README) —
+ * `{ mailing_address: { street, ... }, claims: [ { amount, ... } ] }`. Built from a
+ * `FormMapping` via `toFillMapping` at approve time and persisted as the outbox payload; the
+ * worker hands it to `fillForm` verbatim. Structurally identical to `FormMapping` (both are
+ * `Record<string, JsonValue>`), so the alias documents intent — flat-review vs nested-fill —
+ * rather than being nominally enforced by the type checker.
+ */
+export type FillMapping = Record<string, JsonValue>
 
 /** One resolved per-draft binding row emitted by a renderer. */
 export interface FieldBinding {
@@ -424,6 +439,7 @@ export interface FieldBinding {
   profile_field_path: string   // e.g. "claims.{item_id}.amount"
 }
 
+/** `mapping` is the FLAT review mapping; `fieldBindings` key off the same flat paths. */
 export interface RenderResult {
   mapping: FormMapping
   fieldBindings: FieldBinding[]
@@ -952,14 +968,15 @@ git commit -m "feat: idempotent collection item identity"
 - Produces:
   - `STATIC_BINDINGS: Record<FormType, { form_field_path: string; profile_field_path: string }[]>` (scalars/fixed).
   - `reverseResolve(formType, formFieldPath, draftBindings): string | undefined` — array paths via `draftBindings`, else static.
-  - `renderForm(formType, currentFacts: Map<string,Fact>): RenderResult` — walks static + expands `claims.{item_id}.*` positionally into `claims[i].*`, emitting per-draft `FieldBinding`s.
+  - `renderForm(formType, currentFacts: Map<string,Fact>): RenderResult` — walks static + expands `claims.{item_id}.*` positionally into `claims[i].*`, emitting per-draft `FieldBinding`s. Produces the FLAT review mapping only.
+  - `toFillMapping(flat: FormMapping): FillMapping` — pure unflatten of the flat review mapping into the nested `fill_form` contract shape (dotted keys → nested objects, `claims[i].*` → arrays). Called at approve time to build the outbox payload; the flat mapping is what humans review.
 
 - [ ] **Step 1: Write the failing test**
 
 ```ts
 // tests/forms/renderers.test.ts
 import { describe, it, expect } from 'vitest'
-import { renderForm, reverseResolve } from '../../src/forms/renderers.js'
+import { renderForm, reverseResolve, toFillMapping } from '../../src/forms/renderers.js'
 import type { Fact } from '../../src/schema/profile.js'
 
 function fact(field_path: string, value: unknown): Fact {
@@ -1006,6 +1023,32 @@ describe('renderForm', () => {
 
   it('reverseResolve falls back to static map for scalars', () => {
     expect(reverseResolve('acord_125', 'policyholder_first_name', [])).toBe('policyholder_first_name')
+  })
+})
+
+describe('toFillMapping', () => {
+  it('nests dotted keys into the fill_form contract object shape', () => {
+    const flat = {
+      fein: '12-3456789',
+      'mailing_address.street': 'PO Box 9102',
+      'mailing_address.city': 'Wilmington',
+      'mailing_address.state': 'NC',
+      'mailing_address.zip': '28402',
+    }
+    expect(toFillMapping(flat)).toEqual({
+      fein: '12-3456789',
+      mailing_address: { street: 'PO Box 9102', city: 'Wilmington', state: 'NC', zip: '28402' },
+    })
+  })
+
+  it('expands bracketed indices into a dense, ordered array of objects', () => {
+    const flat = {
+      'claims[0].year': 2023, 'claims[0].amount': 30000,
+      'claims[1].year': 2024, 'claims[1].amount': 15000,
+    }
+    expect(toFillMapping(flat)).toEqual({
+      claims: [ { year: 2023, amount: 30000 }, { year: 2024, amount: 15000 } ],
+    })
   })
 })
 ```
@@ -1058,7 +1101,7 @@ export const COLLECTION_BINDINGS: Record<FormType, { form_prefix: string; collec
 ```ts
 // src/forms/renderers.ts
 import type { Fact, FormType } from '../schema/profile.js'
-import type { FieldBinding, FormMapping, RenderResult } from '../schema/forms.js'
+import type { FieldBinding, FillMapping, FormMapping, JsonValue, RenderResult } from '../schema/forms.js'
 import { STATIC_BINDINGS, COLLECTION_BINDINGS } from './bindings.js'
 
 /** Effective value: a human-approved correction (reviewed_value_json) overrides the machine value. */
@@ -1119,12 +1162,45 @@ export function reverseResolve(
 export function boundScalarPaths(formType: FormType): string[] {
   return STATIC_BINDINGS[formType].map(b => b.profile_field_path)
 }
+
+/**
+ * Unflatten a FLAT review mapping into the NESTED shape the real `fill_form` service expects
+ * (README): dotted keys (`mailing_address.street`) become nested objects and bracketed keys
+ * (`claims[0].amount`) become arrays of objects, e.g.
+ *   { fein, 'mailing_address.street': 'PO Box 9102', 'claims[0].amount': 30000 }
+ *     -> { fein, mailing_address: { street: 'PO Box 9102' }, claims: [ { amount: 30000 } ] }
+ * The flat mapping stays the human review surface + draft projection; this nested mapping is
+ * what we persist as the outbox payload and hand to `fillForm`. Pure and deterministic — same
+ * flat mapping always yields the same nested object. renderForm emits contiguous array indices
+ * (0..n-1) in sorted item order, so arrays are dense and correctly ordered.
+ */
+export function toFillMapping(flat: FormMapping): FillMapping {
+  const root: Record<string, JsonValue> = {}
+  for (const [flatKey, value] of Object.entries(flat)) {
+    // "claims[0].amount" -> ["claims", 0, "amount"]; "mailing_address.street" -> [..., "street"]
+    const segments: (string | number)[] = []
+    for (const part of flatKey.split('.')) {
+      const m = part.match(/^(.+?)\[(\d+)\]$/)
+      if (m) { segments.push(m[1]!, Number(m[2]!)) } else { segments.push(part) }
+    }
+    // Walk the path, materialising an array when the next segment is a numeric index else an object.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mutable heterogeneous cursor
+    let cur: any = root
+    for (let i = 0; i < segments.length - 1; i++) {
+      const seg = segments[i]!
+      if (cur[seg] === undefined) cur[seg] = typeof segments[i + 1] === 'number' ? [] : {}
+      cur = cur[seg]
+    }
+    cur[segments[segments.length - 1]!] = value
+  }
+  return root
+}
 ```
 
 - [ ] **Step 5: Run to verify it passes**
 
 Run: `npx vitest run tests/forms/renderers.test.ts`
-Expected: PASS (4 tests).
+Expected: PASS (6 tests).
 
 - [ ] **Step 6: Commit**
 
@@ -1759,6 +1835,17 @@ describe('fillForm', () => {
     const b = await fillForm('c1', 'acord_125', { fein: 'B' }, blob)
     expect(a.pdf_ref).not.toBe(b.pdf_ref)
   })
+  it('persists the nested fill_form contract shape verbatim (objects + arrays)', async () => {
+    const blob = new MemoryBlobStore()
+    const fill = {
+      fein: '12-3456789',
+      mailing_address: { street: 'PO Box 9102', city: 'Wilmington', state: 'NC', zip: '28402' },
+      claims: [ { year: 2023, amount: 30000 } ],
+    }
+    const r = await fillForm('c1', 'acord_125', fill, blob)
+    const stored = JSON.parse((await blob.get(r.pdf_ref))!.toString())
+    expect(stored.mapping).toEqual(fill)   // nested structure round-trips into the "PDF"
+  })
 })
 ```
 
@@ -1788,16 +1875,18 @@ export class MemoryBlobStore implements BlobStore {
 ```ts
 // src/forms/fillForm.ts
 import type { FormType } from '../schema/profile.js'
-import type { FormMapping } from '../schema/forms.js'
+import type { FillMapping } from '../schema/forms.js'
 import type { BlobStore } from '../blob/blobStore.js'
 import { contentHash } from '../util/hash.js'
 
 /**
- * Stub for the real form-filling service. Produces "PDF bytes" (the JSON mapping) and
- * stores them at a deterministic, content-addressed key so retries are idempotent.
+ * Stub for the real form-filling service. Receives the NESTED fill mapping (the README
+ * `fill_form` contract shape, built via `toFillMapping`) — not the flat review mapping.
+ * Produces "PDF bytes" (the JSON mapping) and stores them at a deterministic,
+ * content-addressed key so retries are idempotent.
  */
 export async function fillForm(
-  customerId: string, formType: FormType, mapping: FormMapping, blob: BlobStore,
+  customerId: string, formType: FormType, mapping: FillMapping, blob: BlobStore,
 ): Promise<{ pdf_ref: string; content_hash: string }> {
   const hash = contentHash({ customerId, formType, mapping })
   const pdf_ref = `pdf/${customerId}/${formType}/${hash}`
@@ -1809,7 +1898,7 @@ export async function fillForm(
 - [ ] **Step 5: Run to verify it passes**
 
 Run: `npx vitest run tests/forms/fillForm.test.ts`
-Expected: PASS (2 tests).
+Expected: PASS (3 tests).
 
 - [ ] **Step 6: Commit**
 
@@ -2002,7 +2091,7 @@ export class DraftsRepo {
 // src/db/repos/outbox.ts
 import type { DB } from '../sqlite.js'
 import type { FormType } from '../../schema/profile.js'
-import type { FormMapping } from '../../schema/forms.js'
+import type { FillMapping } from '../../schema/forms.js'
 import { newId } from '../../util/id.js'
 
 export interface OutboxRow {
@@ -2013,7 +2102,9 @@ export interface OutboxRow {
 
 export class OutboxRepo {
   constructor(private db: DB) {}
-  enqueue(customerId: string, formType: FormType, draftRevision: number, mapping: FormMapping, contentHash: string, now: string): string {
+  // `mapping` is the NESTED fill mapping (README fill_form shape), not the flat review mapping;
+  // it is stored verbatim as payload_json and handed to fillForm by the worker.
+  enqueue(customerId: string, formType: FormType, draftRevision: number, mapping: FillMapping, contentHash: string, now: string): string {
     const id = newId()
     this.db.prepare(`INSERT INTO outbox (id,customer_id,form_type,draft_revision,payload_json,content_hash,status,attempts,next_attempt_at,created_at)
       VALUES (?,?,?,?,?,?, 'pending', 0, ?, ?)`).run(id, customerId, formType, draftRevision, JSON.stringify(mapping), contentHash, now, now)
@@ -2182,7 +2273,7 @@ import type { DraftsRepo } from '../db/repos/drafts.js'
 import type { OutboxRepo } from '../db/repos/outbox.js'
 import type { ConflictsRepo, ConflictRow } from '../db/repos/conflicts.js'
 import type { FormType } from '../schema/profile.js'
-import { renderForm, reverseResolve } from '../forms/renderers.js'
+import { renderForm, reverseResolve, toFillMapping } from '../forms/renderers.js'
 import { STATIC_BINDINGS } from '../forms/bindings.js'
 import { selectCurrentFact } from '../profile/factSelector.js'
 import { contentHash } from '../util/hash.js'
@@ -2256,12 +2347,17 @@ export class ReviewClient {
         }
       }
 
-      // 3. Re-project from the just-approved state.
+      // 3. Re-project from the just-approved state. `mapping` is FLAT (the human review surface
+      //    + draft projection). `fillMapping` is the NESTED fill_form contract shape the PDF
+      //    service consumes; the outbox carries it and content_hash is computed over it so the
+      //    stored hash matches fillForm's content-addressed blob key.
       const fresh = facts.currentMap(customerId)
       const { mapping, fieldBindings } = renderForm(formType, fresh)
-      const hash = contentHash({ customerId, formType, mapping })
+      const fillMapping = toFillMapping(mapping)
+      const hash = contentHash({ customerId, formType, mapping: fillMapping })
 
-      // 4. Supersede any outstanding fill; approve on the right revision.
+      // 4. Supersede any outstanding fill; approve on the right revision. Drafts store the FLAT
+      //    mapping (what the reviewer sees); only the outbox payload is nested.
       const pending = outbox.pendingForForm(customerId, formType)
       let draftRow = current
       if (pending || current.status === 'filled') {
@@ -2274,8 +2370,8 @@ export class ReviewClient {
       drafts.saveBindings(draftRow.id, fieldBindings)
       drafts.approve(draftRow.id, by, now)
 
-      // 5. Enqueue the fill.
-      const outboxId = outbox.enqueue(customerId, formType, draftRow.revision, mapping, hash, now)
+      // 5. Enqueue the fill with the NESTED fill mapping (README fill_form shape).
+      const outboxId = outbox.enqueue(customerId, formType, draftRow.revision, fillMapping, hash, now)
 
       // 6. Shared-field ripple: any OTHER form that reads an edited profile path and is
       //    already approved/filled gets a new needs_review revision (never mutated in place).
@@ -2407,7 +2503,7 @@ import type { DraftsRepo } from '../db/repos/drafts.js'
 import type { LeaseClaimer } from '../lease/leaseClaimer.js'
 import type { BlobStore } from '../blob/blobStore.js'
 import type { FormType } from '../schema/profile.js'
-import type { FormMapping } from '../schema/forms.js'
+import type { FillMapping } from '../schema/forms.js'
 import { fillForm } from '../forms/fillForm.js'
 
 export interface OutboxWorkerDeps {
@@ -2427,7 +2523,8 @@ export class OutboxWorker {
       const row = this.d.outbox.get(id)
       if (!row || row.status !== 'processing') continue
       try {
-        const mapping = JSON.parse(row.payload_json) as FormMapping
+        // payload_json is the NESTED fill mapping (README fill_form shape), enqueued at approve time.
+        const mapping = JSON.parse(row.payload_json) as FillMapping
         // External I/O (PDF generation) happens OUTSIDE any DB transaction.
         const { pdf_ref } = await fillForm(row.customer_id, row.form_type as FormType, mapping, this.d.blob)
         // Commit `outbox=done` AND `draft=filled` atomically. If the process dies between
@@ -3074,6 +3171,10 @@ resolved here:
 - **`not_applicable`** — honestly scoped: `approved_blank` sign-off is built and tested; reviewer-initiated present→N/A is documented in Explicit Scope / Deferrals, not half-implemented.
 - **`FormMapping`** widened to a recursive `JsonValue` so it can represent the real `fill_form` contract (nested `mailing_address`, `prior_carriers[]`), not just scalars.
 
+**Third review round — flat review mapping vs nested fill mapping:**
+
+- **Two projections, one source.** `renderForm` still emits the FLAT mapping (dotted/bracketed keys) that drives the review UI, edit resolution, draft `projected_json`, and field bindings — a flat, per-field surface is what a human reviewer (and reverse-edit resolution) needs. A new pure `toFillMapping` unflattens it into the NESTED `fill_form` contract shape (README: `mailing_address: {…}`, `claims: […]`), which is what the outbox payload carries and `fillForm` consumes. Human-facing mapping ≠ machine-facing mapping; both derive deterministically from the same facts. `FillMapping` alias added (structurally identical to `FormMapping`, documents intent). `content_hash` is now computed over the nested fill mapping so the stored hash matches `fillForm`'s content-addressed blob key. Tests added: `toFillMapping` (objects + arrays) and `fillForm` round-trips the nested shape verbatim.
+
 **Placeholder scan:** No TBD/TODO; every code step has complete code. The one explicit "both arms equal" branch in Task 9 is documented as intentional, not a placeholder.
 
-**Type consistency:** `selectCurrentFact`, `renderForm`/`reverseResolve`/`boundScalarPaths`, `LeaseClaimer.{claim,complete,fail}`, `FactsRepo.{insertMany,byField,currentMap,markApproved,allFieldPaths}`, `DraftsRepo.{upsertProjection,newRevision,saveBindings,getBindings,approve,markFilled,supersede,byId,current}`, `OutboxRepo.{enqueue,pendingForForm,cancel,get}`, `ReviewClient.{getDraft,approveForm,listUnresolvedConflicts,resolveConflict}` — names used identically across all consuming tasks. ✅
+**Type consistency:** `selectCurrentFact`, `renderForm`/`reverseResolve`/`boundScalarPaths`/`toFillMapping`, `LeaseClaimer.{claim,complete,fail}`, `FactsRepo.{insertMany,byField,currentMap,markApproved,allFieldPaths}`, `DraftsRepo.{upsertProjection,newRevision,saveBindings,getBindings,approve,markFilled,supersede,byId,current}`, `OutboxRepo.{enqueue,pendingForForm,cancel,get}`, `ReviewClient.{getDraft,approveForm,listUnresolvedConflicts,resolveConflict}` — names used identically across all consuming tasks. ✅
