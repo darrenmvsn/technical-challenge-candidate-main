@@ -82,14 +82,29 @@ export function toFillMapping(flat: FormMapping): FillMapping {
       if (m) { segments.push(m[1]!, Number(m[2]!)) } else { segments.push(part) }
     }
     // Walk the path, materialising an array when the next segment is a numeric index else an object.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mutable heterogeneous cursor
-    let cur: any = root
+    // The cursor is a JSON container (object or array); each step narrows on segment kind.
+    let cur: Record<string, JsonValue> | JsonValue[] = root
     for (let i = 0; i < segments.length - 1; i++) {
       const seg = segments[i]!
-      if (cur[seg] === undefined) cur[seg] = typeof segments[i + 1] === 'number' ? [] : {}
-      cur = cur[seg]
+      const fresh: JsonValue = typeof segments[i + 1] === 'number' ? [] : {}
+      if (typeof seg === 'number' && Array.isArray(cur)) {
+        if (cur[seg] === undefined) cur[seg] = fresh
+        cur = asContainer(cur[seg]!)
+      } else if (typeof seg === 'string' && !Array.isArray(cur)) {
+        if (cur[seg] === undefined) cur[seg] = fresh
+        cur = asContainer(cur[seg]!)
+      }
     }
-    cur[segments[segments.length - 1]!] = value
+    const last = segments[segments.length - 1]!
+    if (typeof last === 'number' && Array.isArray(cur)) cur[last] = value
+    else if (typeof last === 'string' && !Array.isArray(cur)) cur[last] = value
   }
   return root
+}
+
+/** Narrow a freshly-descended JSON node to its container type (object or array). */
+function asContainer(v: JsonValue): Record<string, JsonValue> | JsonValue[] {
+  if (Array.isArray(v)) return v
+  if (v !== null && typeof v === 'object') return v
+  throw new Error('toFillMapping: expected a JSON container node')
 }
