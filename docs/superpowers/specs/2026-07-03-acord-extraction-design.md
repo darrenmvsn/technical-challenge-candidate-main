@@ -100,13 +100,25 @@ extraction reorders the list or inserts an item, which would corrupt reconciliat
 scramble a human's per-item edits.
 
 So each repeated item gets a **stable `item_id`** and facts key on it:
-`claims.{item_id}.amount`, not `claims[0].amount`. The `item_id` is assigned on first
-extraction and **matched across transcripts by a natural key** (e.g. a claim by
-`year + type`, a prior carrier by `carrier_name`, a location by normalized address) so a
-correction in call #2 updates the *same* claim rather than appending a duplicate. When no
-confident natural-key match exists, it's treated as a new item and surfaced for review
+`claims.{item_id}.amount`, not `claims[0].amount`. Items are **matched across transcripts by
+a natural key** (a claim by `year + type`, a prior carrier by `carrier_name`, a location by
+normalized address) so a correction in call #2 updates the *same* claim rather than
+appending a duplicate. No confident natural-key match → new item, surfaced for review
 (merge/split is a human decision, never a silent guess). Reconciliation and the presence
-axis then operate per item-field, exactly as they do for scalars.
+axis then operate per item-field, exactly as for scalars.
+
+**`item_id` must be idempotent across reprocessing.** Extraction is at-least-once (a
+`processing_jobs` retry re-runs the same source), so generating a fresh random id per run
+would fork one claim into duplicates. Two mechanisms, used together:
+
+- **Deterministic id** = a hash of (`customer_id`, `collection`, `natural_key`). Re-running
+  the same source yields the *same* id, so re-extraction is idempotent by construction.
+- **`collection_items` registry** persists `natural_key → item_id`, so items whose natural
+  key is weak or *changes over time* (a claim amount corrected, an address re-normalized)
+  still resolve to the existing id via the registry rather than minting a new one. First
+  sighting inserts; later sightings look up.
+
+Reprocessing the same transcript therefore never creates duplicate items or orphan facts.
 
 ## Components (clean boundaries)
 
@@ -115,11 +127,11 @@ axis then operate per item-field, exactly as they do for scalars.
 | `ingest/webhook` | Validate payload, dedupe by source id, **in one txn** persist raw source + insert `processing_jobs` row, return 202 | sources + jobs repos |
 | `storage/sources` | Append-only raw-source store (source of truth) | sqlite |
 | `extraction/extractor` | transcript(s) → Zod-validated facts w/ provenance + confidence | `LlmClient` |
-| `profile/reconciler` | Merge fact candidates into canonical profile; conflict detection | facts repo |
-| `forms/bindings` | Static `(formType, formFieldPath) ↔ profileFieldPath` map; forward for renderers, reverse for `approveForm` edits | — |
-| `forms/renderers` | Pure `profile → {field name: value}` projections for 125 & 126, driven by `bindings` | bindings |
+| `profile/reconciler` | Merge candidates via `selectCurrentFact`; **materialize `presence: missing` rows for every form-bound field**; write `conflicts` rows when a newer candidate disagrees with an approved fact | facts repo, factSelector, bindings |
+| `forms/bindings` | Static `(formType, formFieldPath) ↔ profileFieldPath` map for scalar/fixed fields | — |
+| `forms/renderers` | Pure `profile → { mapping, fieldBindings }` projections for 125 & 126; emit the concrete **per-draft** binding rows (incl. array `claims[i] → claims.{item_id}`) alongside the mapping | bindings |
 | `forms/fillForm` | Stub: `(formType, mapping) → bytes`; writes to blob store at a deterministic key | blob store |
-| `review/ReviewClient` | The TS "UI stand-in": list/get drafts, get field + provenance, `approveForm(edits?)` (one short txn) | facts + drafts + outbox repos, bindings |
+| `review/ReviewClient` | The TS "UI stand-in": list/get drafts, get field + provenance, `listUnresolvedConflicts`, `resolveConflict`, `approveForm(edits?)` (one short txn) | facts + drafts + outbox + conflicts repos, bindings |
 | `worker/processor` | Claims `processing_jobs` (lease): extract → reconcile → re-project drafts → needs_review; retry/dead-letter | jobs repo, extractor, reconciler |
 | `worker/outboxWorker` | Claims `outbox` (lease): wake-on-commit + adaptive backstop poll; calls `fillForm`, `approved→filled`, per-row retry backoff | outbox repo, fillForm |
 | `worker/leaseClaimer` | Shared claim primitive: atomically lease pending/expired rows with `locked_until` + fresh `lock_token`; reclaim on crash; token-fenced completion so a stale worker can't finish reclaimed work | sqlite |
@@ -147,17 +159,30 @@ The LLM sits behind `LlmClient` so extraction is deterministic and testable with
   per (`customer_id`, `field_path`) is chosen by an explicit selection rule
   (see Current-Fact Selection), **not** simply the latest-inserted row.
 - **form_drafts**(`id` PK, `customer_id`, `form_type`, `revision`, `projected_json`,
-  `status` [`needs_review`|`approved`|`filled`|`superseded`], `approved_by`, `approved_at`,
-  `pdf_ref`, `superseded_by_revision`, `created_at`, `updated_at`) — one row **per
-  revision**. A `filled` row is **immutable** (audit artifact); re-review creates a new
-  revision (see Draft Revisions). Unique current row = highest `revision` per
+  `status` [`needs_review`|`approved`|`filled`], `approved_by`, `approved_at`, `pdf_ref`,
+  `superseded_by_revision` (nullable), `created_at`, `updated_at`) — one row **per
+  revision**. `status` is the row's own lifecycle and is **not** overwritten when a newer
+  revision appears; supersession is recorded **only** by setting `superseded_by_revision`
+  (so a `filled` row stays `filled` forever — an accurate audit record — even after it's
+  superseded). Current row = highest `revision` with `superseded_by_revision IS NULL` per
   (`customer_id`, `form_type`).
+- **draft_field_bindings**(`draft_id` FK, `form_field_path` (concrete, e.g.
+  `claims[0].amount`), `profile_field_path` (stable, e.g. `claims.{item_id}.amount`)) —
+  **per-draft** resolved bindings; PK (`draft_id`, `form_field_path`). See Per-Draft
+  Bindings.
+- **collection_items**(`id` PK = deterministic `item_id`, `customer_id`, `collection`
+  [`claims`|`locations`|`prior_carriers`|…], `natural_key`, `created_at`) — registry that
+  makes `item_id` **idempotent across reprocessing** (see Collection Identity).
 - **outbox**(`id` PK, `customer_id`, `form_type`, `draft_revision`, `payload_json` (the
   approved mapping), `content_hash`, `status`
   [`pending`|`processing`|`done`|`dead`|`cancelled`], `attempts`, `next_attempt_at`,
   `locked_until`, `lock_token`, `locked_by`, `created_at`) — durable intent-to-fill; written
   in the same transaction as the approval. A re-approval **cancels** any still-`pending` row
   for the same (`customer_id`, `form_type`) rather than editing it (see Re-Approval).
+- **conflicts**(`id` PK, `customer_id`, `field_path`, `current_fact_id` (the
+  still-current, usually human-approved fact), `conflicting_fact_id` (the newer candidate
+  that disagrees), `status` [`unresolved`|`resolved`], `resolved_by`, `resolved_at`,
+  `created_at`) — explicit conflict ledger (see Visible Conflicts).
 - **customers**(`id` PK, `name`, `dba`, `owner`) — minimal.
 
 The append-only `facts` ledger is what enables audit + correction detection. A simpler
@@ -201,11 +226,21 @@ deterministic `selectCurrentFact(candidates)` that sorts by, in order:
 Making this a named pure function (not an `ORDER BY id LIMIT 1`) means selection is
 unit-testable in isolation and identical everywhere it's read.
 
-### Conflict, not silent overwrite
+### Visible Conflicts (not silent overwrite)
 
 A newer machine extraction that disagrees with an **already-approved** value does **not**
-win rule 2 — approval outranks it. Instead the field is flagged `conflict` and surfaced for
-re-review, so a human decides whether the new call actually supersedes their prior sign-off.
+win rule 2 — approval outranks it, so the approved fact *stays current*. The danger: if the
+only signal were the current value, the disagreement would be **invisible** — the reviewer
+would never learn the latest call contradicts their earlier sign-off.
+
+So a disagreement writes a row to the **`conflicts`** ledger (`current_fact_id` = the
+approved fact, `conflicting_fact_id` = the newer candidate, `status = unresolved`). The
+newer candidate is retained (not superseded), and `ReviewClient.listUnresolvedConflicts(customerId)`
+surfaces every open conflict **independently of which value is currently winning**. A human
+resolves it — keep the approved value, or promote the new one (a fresh approval, which then
+flows through re-projection + a new revision) — flipping the conflict to `resolved`. This
+read model is what guarantees corrections are never quietly dropped just because a human had
+already approved.
 
 ## Approval, Atomicity & the Outbox
 
@@ -221,38 +256,64 @@ canonical store holds *profile* facts, so the transaction first resolves each ed
 the **reverse binding** `(formType, formFieldPath) → profileFieldPath` before writing.
 The transaction does DB-only work and nothing else:
 
-1. **Resolve** each edit's ACORD field path → profile field path via `bindings`. An edit
-   with no binding is rejected (surfaces a mapping gap rather than silently dropping).
+1. **Resolve** each edit's ACORD field path → profile field path: array-element paths via
+   the draft's **persisted `draft_field_bindings`**, scalars via the static map. An edit
+   that resolves to nothing is rejected (surfaces a mapping gap rather than silently
+   dropping).
 2. Apply resolved edits → those facts get `reviewed_value` / `presence` set.
 3. **Approve every field the form uses, not only the edited ones.** Approving a form is a
    human signing off on the *whole rendered form*, so every profile fact reachable from this
    form's bindings is marked `review_status: "approved"` (edited or not). Otherwise an
    untouched machine value would ride onto a carrier-bound PDF without anyone having
-   approved it — and a later extraction could still silently flip it. (Fields the reviewer
-   deliberately left blank become `approved_blank` / `not_applicable`.)
-4. **Re-project** the form draft JSON from the just-approved state (persisted JSON and
-   the PDF input are therefore guaranteed identical — no drift).
-5. **Supersede any in-flight fill.** If a still-`pending` outbox row exists for this
-   (`customer_id`, `form_type`), mark it `cancelled` and open a **new draft revision** —
-   never edit the pending row in place (see Re-Approval). Set `form_drafts.status = approved`
-   on the current revision.
+   approved it — and a later extraction could still silently flip it. **This requires a fact
+   row to exist for every bound field, including blanks** — so the reconciler materializes a
+   `presence: missing` (value `null`, `evidence: null`) row for any bound field a transcript
+   never mentioned. Approve-all then flips these to `approved_blank` (or the reviewer sets
+   `not_applicable`); without the materialized rows there'd be nothing to mark.
+4. **Re-project** the form draft JSON from the just-approved state (persisted JSON and the
+   PDF input are therefore guaranteed identical — no drift), and **persist the fresh
+   `draft_field_bindings`** for this revision.
+5. **Approve the draft, superseding any outstanding fill.** *First approval (no `pending`/
+   `processing`/`filled` predecessor):* set `form_drafts.status = approved` on the current
+   revision. *Re-approval (an outbox row is `pending`/`processing`, or the draft is
+   `filled`):* `cancel` the outstanding outbox row, set `superseded_by_revision` on the prior
+   draft, and create a **new revision** with `status = approved` — never edit the outstanding
+   row in place (see Re-Approval).
 6. Insert a fresh **outbox** row (`pending`) carrying the approved mapping + `draft_revision`
    + `content_hash`.
 7. **Commit.**
 
-Bindings are bidirectional and the single source of truth for the DRY overlap: two form
-entries pointing at the same `profileFieldPath` *are* the definition of a shared field.
-Renderers walk the map forward; `approveForm` walks it in reverse.
+Bindings are the single source of truth for the DRY overlap: two form entries pointing at
+the same `profileFieldPath` *are* the definition of a shared field. Renderers walk them
+forward; `approveForm` walks them in reverse.
+
+### Per-Draft Bindings (static map isn't enough for arrays)
+
+The static map works for scalars and fixed nested objects (`policyholder_first_name`,
+`mailing_address.street`), where the ACORD path is constant. It **cannot** cover repeated
+collections: the profile holds `claims.{item_id}.amount`, but ACORD renders positionally as
+`claims[0].amount`, `claims[1].amount`, … — and which `item_id` sits at index `0` depends on
+how many claims exist and their order **at render time**. A static table can't know that.
+
+So **at render time the renderer emits the concrete binding rows** and we persist them in
+**`draft_field_bindings`** for that draft revision: `claims[0].amount → claims.{item_id}.amount`.
+When a reviewer edits `claims[0].amount`, `approveForm` reverse-resolves through the
+**persisted per-draft binding** (not the static map) to reach the right item's fact — so an
+edit lands on the intended claim even if a later re-extraction would reorder the array.
+Scalars still use the static map; only array-element paths need the per-draft rows.
 
 ### Re-Approval (a pending fill already exists)
 
-If the form is re-approved while its previous fill is still `pending` (worker hasn't run
-yet) or already `filled`, we must not mutate the outstanding work in place — that would race
-the worker or corrupt an immutable artifact. Instead:
+If the form is re-approved while its previous fill is `pending`, already leased
+(`processing`), or already `filled`, we must not mutate the outstanding work in place — that
+would race the worker or corrupt an immutable artifact. Instead:
 
-- **Pending fill:** `cancel` the pending outbox row and enqueue a new one on a new revision.
-  The cancelled row is skipped by the worker (or, if the worker already leased it, its stale
-  completion is fenced off — see Lease Fencing), so exactly one fill wins.
+- **Pending fill:** `cancel` the row and enqueue a new one on a new revision.
+- **Processing fill (already leased by a worker):** also `cancel` it — cancelling covers
+  `processing`, not just `pending`. Because the worker's completion write is guarded by
+  `status='processing' AND lock_token=?` (see Lease Fencing), flipping the row to
+  `cancelled` makes that in-flight worker's completion **no-op**, so a superseded fill can
+  never mark itself `done`. Exactly one fill (the newest revision's) wins.
 - **Filled already:** leave the `filled` row + PDF immutable; the re-approval lands on a new
   revision with its own outbox row (consistent with the shared-field ripple rule).
 
@@ -288,14 +349,16 @@ CDC (Debezium/Kafka) is both over-weight for one PDF worker and unavailable on S
   (status='pending' OR (status='processing' AND locked_until < now)) AND next_attempt_at <=
   now LIMIT n`. The `locked_until` timeout means a **worker that crashes mid-`fillForm`
   doesn't strand its rows** — the lease expires and another claim reclaims them.
-- **Lease fencing (an expired-but-alive slow worker):** reclaim alone isn't enough — a slow
-  worker whose lease expired could wake up and complete *stale* work over the row a new
-  worker now owns. So every completion/failure write is **guarded by the token**:
-  `UPDATE outbox SET status='done' WHERE id=? AND lock_token=?`. If the row was reclaimed,
-  the token no longer matches and the stale worker's write **no-ops** — only the current
-  lease holder can finish the row. (Idempotent `fillForm` + deterministic key means even a
-  duplicated blob write is harmless; fencing keeps the *state machine* correct.) The same
-  primitive backs `processing_jobs`.
+- **Lease fencing (an expired-but-alive slow worker, or a cancelled row):** reclaim alone
+  isn't enough — a slow worker whose lease expired could wake up and complete *stale* work
+  over the row a new worker now owns, and a re-approval may have `cancelled` the row out from
+  under it. So every completion/failure write is **guarded by both token and status**:
+  `UPDATE outbox SET status='done' WHERE id=? AND lock_token=? AND status='processing'`. If
+  the row was reclaimed (token changed) **or** cancelled (status no longer `processing`), the
+  stale worker's write **no-ops** — only the current lease holder of a still-`processing` row
+  can finish it. (Idempotent `fillForm` + deterministic key means even a duplicated blob
+  write is harmless; fencing keeps the *state machine* correct.) The same primitive backs
+  `processing_jobs`.
 - **Per-row retry backoff:** on `fillForm` failure, bump `attempts` + set `next_attempt_at`
   (exponential: 5s → 30s → 2m → 10m…); the poller skips future-dated rows; dead-letter
   (`status='dead'`) after N.
@@ -321,8 +384,10 @@ Forms are projections of one profile, so editing a **shared** field (e.g.
 A `filled` draft is an **immutable audit artifact** — a PDF may already be sitting with a
 carrier — so we **never mutate it back to `needs_review`**. Instead, when a shared edit
 invalidates a `filled` (or `approved`) ACORD 126, we **create a new `form_drafts` revision**
-(`revision + 1`, status `needs_review`, `superseded_by_revision` set on the old row which
-stays `filled`/`superseded`). Re-review and any new fill happen on the new revision; the
+(`revision + 1`, status `needs_review`) and set `superseded_by_revision` on the old row.
+The old row **keeps its own status** (`filled` stays `filled`) — supersession is recorded
+solely via `superseded_by_revision`, so the audit trail shows exactly what was filled and
+that it was later superseded. Re-review and any new fill happen on the new revision; the
 prior PDF and its approval remain a permanent record. Approval stays per-form; shared edits
 ripple as a **new revision to re-review**, not an in-place downgrade.
 
@@ -337,9 +402,10 @@ drift.
 
 The schema is an **envelope**, not bare values — each field is
 `{ value: T | null, presence: "present"|"missing"|"needs_follow_up"|"not_applicable",
-confidence: number, evidence: string }`. The model must set `presence` (never emit a bare
-`null` whose meaning is ambiguous), and enums (e.g. `entity_type`) constrain it to valid
-values. This carries the provenance, confidence, and absence-reason the review step needs.
+confidence: number, evidence: string | null }`. The model must set `presence` (never emit a
+bare `null` whose meaning is ambiguous), `evidence` is `null` for a `missing` field, and
+enums (e.g. `entity_type`) constrain it to valid values. This carries the provenance,
+confidence, and absence-reason the review step needs.
 
 **The core pattern is identical across libraries:** give the model a schema →
 constrained/guided generation for shape → **validate the result at runtime** → hand the app
@@ -411,18 +477,27 @@ The extractor must handle messy speech and prefer flagging over inventing precis
   transcripts by natural key; unmatched → new item), reconciler (presence states), extractor
   with mocked `LlmClient`, evidence matcher (exact/normalized/ambiguous/none → `needs_review`;
   missing → null evidence), `ReviewClient`.
-- **Approval semantics:** `approveForm` marks **every** form-bound fact approved (not just
-  edits); a subsequent machine extraction cannot silently flip an approved field.
-- **Re-approval:** re-approving with a `pending` outbox row `cancel`s it + opens a new
-  revision (no in-place edit); re-approving a `filled` form lands on a new revision.
+- **Per-draft bindings (arrays):** edit `claims[0].amount` on a draft, then a re-extraction
+  reorders the array → assert the edit still resolved to the original claim's `item_id` via
+  the persisted `draft_field_bindings`.
+- **Idempotent item_id:** reprocess the *same* source twice → no duplicate collection items,
+  same `item_id` (deterministic id + `collection_items` registry); a corrected natural key
+  still resolves to the existing item.
+- **Approval semantics:** `approveForm` marks **every** form-bound fact approved (incl.
+  materialized `presence: missing` rows → `approved_blank`); a subsequent machine extraction
+  cannot silently flip an approved field.
+- **Visible conflicts:** newer candidate disagrees with an approved fact → approved value
+  stays current **and** `listUnresolvedConflicts` returns it; `resolveConflict` clears it.
+- **Re-approval:** re-approving cancels a `pending` **or `processing`** outbox row + opens a
+  new revision (no in-place edit); re-approving a `filled` form lands on a new revision while
+  the old row **stays `filled`** with `superseded_by_revision` set.
 - **Workers / lease + fencing:** claim leases pending + reclaims lease-expired rows; retry
   backoff + dead-letter; idempotent re-delivery (same deterministic key → no dup);
   wake-on-commit vs backstop-poll. Simulate a mid-flight "crash" → assert reclaim; simulate
-  an **expired slow worker** completing with a stale `lock_token` → assert its write no-ops.
+  an **expired slow worker** and a **cancelled row** completing with stale `lock_token` /
+  non-`processing` status → assert both writes no-op.
 - **Durability:** a source + `processing_jobs` row committed together; "restart" (new worker
   instance) re-claims the pending job and completes it.
-- **Revisions:** shared edit against a `filled` ACORD 126 creates a new `needs_review`
-  revision and leaves the old `filled` row immutable.
 - **Integration:** webhook → `processing_jobs` → processor → draft → review → edit →
   `approveForm` (reverse-binding resolution) → outbox → worker → `fillForm` → `filled`,
   mock LLM.
@@ -432,16 +507,16 @@ The extractor must handle messy speech and prefer flagging over inventing precis
 ## Prototype Build Order
 
 1. Schemas: `BusinessProfile` (Zod), fact shape (value + presence + nullable evidence + confidence + match_quality + stable `field_path`), form field types.
-2. Storage: sqlite repos (sources, processing_jobs, facts, drafts, outbox) + blob store + shared **lease-claim primitive with token fencing**.
-3. `forms/bindings` — the bidirectional `(formType, formFieldPath) ↔ profileFieldPath` map (foundation for renderers *and* approve).
-4. `selectCurrentFact` + `collectionIdentity` (stable `item_id` matching) — pure, unit-tested first.
+2. Storage: sqlite repos (sources, processing_jobs, facts, collection_items, drafts, draft_field_bindings, outbox, conflicts) + blob store + shared **lease-claim primitive with token fencing**.
+3. `forms/bindings` — static scalar map + renderer-emitted **per-draft** bindings for array elements.
+4. `selectCurrentFact` + `collectionIdentity` (deterministic `item_id` + registry) — pure, unit-tested first.
 5. Extractor + `LlmClient` interface (+ bounded retry) + mock; evidence matcher (exact/normalized/ambiguous/none; missing → null).
-6. Reconciler (candidates → current facts via `selectCurrentFact`, presence states, conflict flagging).
-7. Form renderers (125, 126) driven by bindings — the DRY payoff.
+6. Reconciler (candidates → current facts via `selectCurrentFact`; materialize `missing` rows for bound fields; write `conflicts`).
+7. Form renderers (125, 126) → `{ mapping, fieldBindings }`, driven by bindings — the DRY payoff.
 8. Processor as a token-fenced `processing_jobs` claimant (durable ingest).
 9. `fillForm` stub + deterministic blob key.
-10. `ReviewClient.approveForm` (reverse-binding resolution; approve **all** form-bound facts; supersede pending fill; short txn) + revision-based ripple.
-11. Outbox worker (wake-on-commit + adaptive backstop poll + lease recovery + token fencing + per-row retry backoff).
+10. `ReviewClient` — `approveForm` (per-draft reverse-resolution; approve **all** form-bound facts; supersede pending/processing fill; persist bindings; short txn) + `listUnresolvedConflicts`/`resolveConflict`.
+11. Outbox worker (wake-on-commit + adaptive backstop poll + lease recovery + token+status fencing + per-row retry backoff).
 12. Webhook (Fastify) writing source + job in one txn.
 13. Tests throughout.
 
