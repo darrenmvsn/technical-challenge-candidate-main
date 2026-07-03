@@ -41,6 +41,8 @@ describe('DraftsRepo + OutboxRepo', () => {
     const r2 = drafts.upsertProjection('c1', 'acord_125', { fein: 'B' }, '2025-01-02T00:00:00Z')
     expect(r2.revision).toBe(1)                                 // same row
     expect(r2.status).toBe('needs_review')                     // approval invalidated by new data
+    expect(r2.approved_by).toBeNull()                          // stale approval metadata cleared on reproject
+    expect(r2.approved_at).toBeNull()
     expect(JSON.parse(r2.projected_json).fein).toBe('B')
   })
 

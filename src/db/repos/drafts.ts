@@ -43,7 +43,7 @@ export class DraftsRepo {
     const cur = this.current(customerId, formType)
     if (!cur) return this.insert(customerId, formType, 1, mapping, now)
     if (cur.status === 'filled') return this.newRevision(customerId, formType, mapping, now)
-    this.db.prepare('UPDATE form_drafts SET projected_json=?, status=?, updated_at=? WHERE id=?')
+    this.db.prepare('UPDATE form_drafts SET projected_json=?, status=?, approved_by=NULL, approved_at=NULL, updated_at=? WHERE id=?')
       .run(JSON.stringify(mapping), 'needs_review', now, cur.id)
     return this.byId(cur.id)!
   }
