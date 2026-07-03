@@ -113,12 +113,17 @@ would fork one claim into duplicates. Two mechanisms, used together:
 
 - **Deterministic id** = a hash of (`customer_id`, `collection`, `natural_key`). Re-running
   the same source yields the *same* id, so re-extraction is idempotent by construction.
-- **`collection_items` registry** persists `natural_key → item_id`, so items whose natural
-  key is weak or *changes over time* (a claim amount corrected, an address re-normalized)
-  still resolve to the existing id via the registry rather than minting a new one. First
-  sighting inserts; later sightings look up.
+- **`collection_items` registry** persists `natural_key → item_id`. First sighting inserts;
+  later sightings with the **same** natural key look it up and reuse the id — so identity is
+  stable for a well-chosen key (a claim's `year+type`, a carrier's name).
 
 Reprocessing the same transcript therefore never creates duplicate items or orphan facts.
+
+**When a natural key genuinely changes** (a corrected claim year, a re-typed carrier name),
+the new key misses the registry and a **new item** is minted and **surfaced for review** —
+we do **not** silently auto-merge it onto the old item, because guessing that two
+differently-keyed items are "the same" is exactly the merge/split judgment that belongs to a
+human. The registry guarantees *stability*, not *fuzzy re-identification*.
 
 ## Components (clean boundaries)
 

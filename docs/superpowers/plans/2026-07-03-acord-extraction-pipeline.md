@@ -23,6 +23,27 @@
 
 ---
 
+## ⚠️ Explicit Scope / Deferrals (read before implementing)
+
+This plan builds the **full pipeline and every correctness invariant** end-to-end, but
+deliberately wires a **representative field set**, not all of `schema.md`:
+
+- **ACORD 125** is wired with a real cross-section of fields (identity, revenue, employees,
+  mailing address leaves, one `claims` collection).
+- **ACORD 126** is wired with **only the fields it shares with 125** (`employee_count_*`) —
+  enough to prove the DRY overlap and the cross-form shared-field ripple. 126-specific
+  fields (GL premises, hazard classifications, products schedule) are **not** wired.
+- `annual_payroll`, `prior_carrier_*`, and the collections `locations`,
+  `prior_carriers`, `hazard_classifications`, `additional_insureds`, `products_schedule`
+  are **not** bound to a form in this build.
+
+Extending to every field is **mechanical**: add rows to `STATIC_BINDINGS` /
+`COLLECTION_BINDINGS` and fields to `ExtractionEnvelope`. No architecture changes. Any field
+present in the envelope but absent from a form's bindings is extracted and stored but never
+projected — that is intentional here, not a bug. **Do not claim full ACORD coverage.**
+
+---
+
 ## File Structure
 
 ```
@@ -168,7 +189,7 @@ export const newLockToken = (): string => uuidv4()
 ```ts
 // tests/util/hash.test.ts
 import { describe, it, expect } from 'vitest'
-import { contentHash, itemIdFor } from '../../src/util/hash.js'
+import { contentHash, itemIdFor, factIdFor } from '../../src/util/hash.js'
 
 describe('contentHash', () => {
   it('is stable regardless of key order', () => {
@@ -187,6 +208,15 @@ describe('itemIdFor', () => {
   it('differs across collections and customers', () => {
     expect(itemIdFor('cust1', 'claims', 'k')).not.toBe(itemIdFor('cust1', 'locations', 'k'))
     expect(itemIdFor('cust1', 'claims', 'k')).not.toBe(itemIdFor('cust2', 'claims', 'k'))
+  })
+})
+
+describe('factIdFor', () => {
+  it('is identical for the same (customer, field, source) — idempotent reprocessing', () => {
+    expect(factIdFor('c1', 'annual_gross_revenue', 's1')).toBe(factIdFor('c1', 'annual_gross_revenue', 's1'))
+  })
+  it('differs across sources so multi-transcript candidates coexist', () => {
+    expect(factIdFor('c1', 'annual_gross_revenue', 's1')).not.toBe(factIdFor('c1', 'annual_gross_revenue', 's2'))
   })
 })
 ```
@@ -215,6 +245,16 @@ export function contentHash(obj: unknown): string {
 
 export function itemIdFor(customerId: string, collection: string, naturalKey: string): string {
   return createHash('sha256').update(`${customerId}|${collection}|${naturalKey}`).digest('hex').slice(0, 24)
+}
+
+/**
+ * Deterministic fact id so re-extracting the SAME source is idempotent: same
+ * (customer, field_path, source_id) -> same PK -> INSERT OR IGNORE de-dupes on reprocessing
+ * (and preserves any human approval already on the row). Different sources -> different ids
+ * (the multi-transcript candidate ledger).
+ */
+export function factIdFor(customerId: string, fieldPath: string, sourceId: string): string {
+  return createHash('sha256').update(`${customerId}|${fieldPath}|${sourceId}`).digest('hex').slice(0, 32)
 }
 ```
 
@@ -913,6 +953,13 @@ describe('renderForm', () => {
     expect(mapping.policyholder_first_name).toBe('Mike')
   })
 
+  it('renders the human-approved correction, not the stale machine value', () => {
+    const corrected = fact('annual_gross_revenue', 2500000)   // machine value
+    corrected.reviewed_value_json = JSON.stringify(2800000)    // human edit, review_status already 'approved'
+    const { mapping } = renderForm('acord_125', new Map([['annual_gross_revenue', corrected]]))
+    expect(mapping.annual_gross_revenue).toBe(2800000)
+  })
+
   it('expands a claims collection positionally and emits per-draft bindings', () => {
     const facts = new Map([
       ['claims.itemA.amount', fact('claims.itemA.amount', 30000)],
@@ -988,8 +1035,15 @@ import type { Fact, FormType } from '../schema/profile.js'
 import type { FieldBinding, FormMapping, RenderResult } from '../schema/forms.js'
 import { STATIC_BINDINGS, COLLECTION_BINDINGS } from './bindings.js'
 
-const val = (f: Fact | undefined): string | number | null =>
-  f ? (f.value_json === null ? null : JSON.parse(f.value_json)) : null
+/** Effective value: a human-approved correction (reviewed_value_json) overrides the machine value. */
+export function effectiveValueJson(f: Fact): string | null {
+  return f.review_status === 'approved' && f.reviewed_value_json !== null ? f.reviewed_value_json : f.value_json
+}
+const val = (f: Fact | undefined): string | number | null => {
+  if (!f) return null
+  const raw = effectiveValueJson(f)
+  return raw === null ? null : JSON.parse(raw)
+}
 
 /** Distinct item_ids present for a collection, sorted for deterministic positional order. */
 function itemIdsFor(collection: string, facts: Map<string, Fact>): string[] {
@@ -1134,10 +1188,10 @@ export function locateEvidence(transcript: string, quote: string | null): Eviden
   if (!normQ) return { quality: 'none', span: null }
   const normHits = allIndexes(normT, normQ)
   if (normHits.length === 1) {
-    // We can't map the normalized offset back to an exact original span cheaply; return a
-    // best-effort span over the original text located via a loosened search, else [0,0].
+    // Try to recover a real span via a loosened case-insensitive search; if that misses we
+    // return a null span rather than a bogus [0,0] that would point at the transcript start.
     const approx = transcript.toLowerCase().indexOf(quote.toLowerCase().trim())
-    const span: [number, number] = approx !== -1 ? [approx, approx + quote.length] : [0, 0]
+    const span: [number, number] | null = approx !== -1 ? [approx, approx + quote.trim().length] : null
     return { quality: 'normalized', span }
   }
   if (normHits.length > 1) return { quality: 'ambiguous', span: null }
@@ -1232,6 +1286,24 @@ describe('extractFacts', () => {
     expect(fein.match_quality).toBe('none')
     expect(fein.review_status).toBe('needs_review')
   })
+
+  it('flattens a fixed nested object into leaf facts matching the form bindings', () => {
+    const env = ExtractionEnvelope.parse({
+      mailing_address: { value: { street: 'PO Box 9102', city: 'Wilmington', state: 'NC', zip: '28402' }, presence: 'present', confidence: 0.9, evidence: 'PO Box 9102, Wilmington, NC 28402' },
+    })
+    const facts = extractFacts(env, { customerId: 'c1', sourceId: 's1', sourceDate: '2025-03-12T10:30:00Z', transcript: 'PO Box 9102, Wilmington, NC 28402', clock, itemsRepo })
+    expect(facts.find(f => f.field_path === 'mailing_address.street')!.value_json).toBe('"PO Box 9102"')
+    expect(facts.find(f => f.field_path === 'mailing_address.zip')!.value_json).toBe('"28402"')
+    expect(facts.find(f => f.field_path === 'mailing_address')).toBeUndefined() // no whole-object fact
+  })
+
+  it('uses a deterministic id so reprocessing the same source does not fork facts', () => {
+    const env = ExtractionEnvelope.parse(fixture)
+    const a = extractFacts(env, { customerId: 'c1', sourceId: 's1', sourceDate: '2025-03-12T10:30:00Z', transcript, clock, itemsRepo })
+    const b = extractFacts(env, { customerId: 'c1', sourceId: 's1', sourceDate: '2025-03-12T10:30:00Z', transcript, clock, itemsRepo })
+    const idOf = (fs: typeof a, p: string) => fs.find(f => f.field_path === p)!.id
+    expect(idOf(a, 'annual_gross_revenue')).toBe(idOf(b, 'annual_gross_revenue'))
+  })
 })
 ```
 
@@ -1292,7 +1364,7 @@ import type { CollectionItemsRepo } from '../db/repos/collectionItems.js'
 import type { ExtractionEnvelope, Fact, EnvelopeField, MatchQuality, Presence } from '../schema/profile.js'
 import { locateEvidence } from './evidenceMatcher.js'
 import { resolveItemId } from '../profile/collectionIdentity.js'
-import { newId } from '../util/id.js'
+import { factIdFor } from '../util/hash.js'
 
 export interface ExtractCtx {
   customerId: string
@@ -1303,19 +1375,15 @@ export interface ExtractCtx {
   itemsRepo: CollectionItemsRepo
 }
 
-function fieldToFact(fieldPath: string, ef: EnvelopeField<unknown>, ctx: ExtractCtx): Fact {
+/** Build one Fact at a leaf field_path with a concrete leaf value + the envelope's provenance. */
+function leafFact(fieldPath: string, leafValue: unknown, ef: EnvelopeField<unknown>, ctx: ExtractCtx): Fact {
   const loc = locateEvidence(ctx.transcript, ef.evidence)
-  const presence = ef.presence as Presence
-  // A present value whose quote can't be pinned down is suspicious -> force human review.
-  const review_status =
-    presence === 'present' && (loc.quality === 'ambiguous' || loc.quality === 'none')
-      ? 'needs_review' : 'needs_review' // all machine facts start needs_review; kept explicit for clarity
   return {
-    id: newId(),
+    id: factIdFor(ctx.customerId, fieldPath, ctx.sourceId), // deterministic -> idempotent reprocessing
     customer_id: ctx.customerId,
     field_path: fieldPath,
-    value_json: ef.value === null || ef.value === undefined ? null : JSON.stringify(ef.value),
-    presence,
+    value_json: leafValue === null || leafValue === undefined ? null : JSON.stringify(leafValue),
+    presence: ef.presence as Presence,
     confidence: ef.confidence,
     evidence_quote: ef.evidence,
     evidence_span_start: loc.span ? loc.span[0] : null,
@@ -1324,7 +1392,8 @@ function fieldToFact(fieldPath: string, ef: EnvelopeField<unknown>, ctx: Extract
     source_id: ctx.sourceId,
     source_date: ctx.sourceDate,
     extracted_at: ctx.clock.now(),
-    review_status,
+    // All machine facts start needs_review; ambiguous/none is surfaced to reviewers via match_quality.
+    review_status: 'needs_review',
     reviewed_value_json: null, reviewed_by: null, reviewed_at: null, superseded_by: null,
   }
 }
@@ -1332,7 +1401,26 @@ function fieldToFact(fieldPath: string, ef: EnvelopeField<unknown>, ctx: Extract
 const isEnvelope = (v: unknown): v is EnvelopeField<unknown> =>
   typeof v === 'object' && v !== null && 'presence' in v && 'confidence' in v
 
-/** Flatten a validated envelope into candidate facts (scalars + collection items). */
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/**
+ * Emit facts for one envelope field. A scalar value -> one fact at `key`. A fixed nested
+ * object value (e.g. mailing_address {street,city,...}) -> one LEAF fact per key
+ * (`mailing_address.street`, ...) so paths line up with the form bindings. A `missing`
+ * object (value null) emits nothing — the reconciler materializes the missing leaf rows.
+ */
+function emitEnvelope(key: string, ef: EnvelopeField<unknown>, ctx: ExtractCtx, out: Fact[]): void {
+  if (isPlainObject(ef.value)) {
+    for (const [leaf, leafVal] of Object.entries(ef.value)) {
+      out.push(leafFact(`${key}.${leaf}`, leafVal, ef, ctx))
+    }
+  } else {
+    out.push(leafFact(key, ef.value, ef, ctx))
+  }
+}
+
+/** Flatten a validated envelope into candidate facts (scalars, nested-object leaves, collection items). */
 export function extractFacts(env: ExtractionEnvelope, ctx: ExtractCtx): Fact[] {
   const facts: Fact[] = []
   for (const [key, val] of Object.entries(env)) {
@@ -1342,18 +1430,16 @@ export function extractFacts(env: ExtractionEnvelope, ctx: ExtractCtx): Fact[] {
         const itemId = resolveItemId(ctx.itemsRepo, ctx.clock, ctx.customerId, key, item.natural_key)
         for (const [field, ef] of Object.entries(item)) {
           if (field === 'natural_key' || !isEnvelope(ef)) continue
-          facts.push(fieldToFact(`${key}.${itemId}.${field}`, ef, ctx))
+          emitEnvelope(`${key}.${itemId}.${field}`, ef, ctx, facts)
         }
       }
     } else if (isEnvelope(val)) {
-      facts.push(fieldToFact(key, val, ctx))
+      emitEnvelope(key, val, ctx, facts)
     }
   }
   return facts
 }
 ```
-
-> Note: the `review_status` branch is intentionally explicit even though both arms are `needs_review` today — machine facts always start `needs_review`; the flagged/ambiguous cases are surfaced to reviewers via `match_quality`, and this keeps the rule obvious for a future reviewer who might make ambiguous facts a distinct state.
 
 - [ ] **Step 6: Run to verify it passes**
 
@@ -1455,7 +1541,9 @@ export class FactsRepo {
   constructor(private db: DB) {}
 
   insertMany(facts: Fact[]): void {
-    const stmt = this.db.prepare(`INSERT INTO facts
+    // OR IGNORE: fact ids are deterministic per (customer, field_path, source_id), so
+    // re-extracting the same source is idempotent and never clobbers a human-approved row.
+    const stmt = this.db.prepare(`INSERT OR IGNORE INTO facts
       (id,customer_id,field_path,value_json,presence,confidence,evidence_quote,evidence_span_start,
        evidence_span_end,match_quality,source_id,source_date,extracted_at,review_status,
        reviewed_value_json,reviewed_by,reviewed_at,superseded_by)
@@ -1490,6 +1578,11 @@ export class FactsRepo {
   markApproved(id: string, reviewedValueJson: string | null, by: string, at: string): void {
     this.db.prepare(`UPDATE facts SET review_status='approved', reviewed_value_json=?, reviewed_by=?, reviewed_at=? WHERE id=?`)
       .run(reviewedValueJson, by, at, id)
+  }
+
+  /** Mark a fact superseded (reserved for explicit ledger tombstoning; selection ignores these). */
+  supersede(id: string, by: string): void {
+    this.db.prepare('UPDATE facts SET superseded_by=? WHERE id=?').run(by, id)
   }
 
   get(id: string): Fact | undefined {
@@ -1542,7 +1635,7 @@ import type { ConflictsRepo } from '../db/repos/conflicts.js'
 import type { Fact, FormType } from '../schema/profile.js'
 import { selectCurrentFact } from './factSelector.js'
 import { boundScalarPaths } from '../forms/renderers.js'
-import { newId } from '../util/id.js'
+import { factIdFor } from '../util/hash.js'
 
 export interface ReconcileCtx {
   db: DB; facts: FactsRepo; conflicts: ConflictsRepo; clock: Clock
@@ -1575,7 +1668,7 @@ export function reconcile(ctx: ReconcileCtx): void {
   for (const path of bound) {
     if (known.has(path)) continue
     missing.push({
-      id: newId(), customer_id: customerId, field_path: path, value_json: null,
+      id: factIdFor(customerId, path, 'system'), customer_id: customerId, field_path: path, value_json: null,
       presence: 'missing', confidence: 0, evidence_quote: null, evidence_span_start: null,
       evidence_span_end: null, match_quality: 'none', source_id: 'system', source_date: now,
       extracted_at: now, review_status: 'needs_review', reviewed_value_json: null,
@@ -1933,21 +2026,38 @@ describe('ReviewClient.approveForm', () => {
   beforeEach(() => {
     db = openDb(); migrate(db)
     facts = new FactsRepo(db); drafts = new DraftsRepo(db); outbox = new OutboxRepo(db); conflicts = new ConflictsRepo(db)
-    rc = new ReviewClient({ db, facts, drafts, outbox, conflicts, clock, onEnqueued: wake })
+    rc = new ReviewClient({ db, facts, drafts, outbox, conflicts, clock, formTypes: ['acord_125', 'acord_126'], onEnqueued: wake })
     seedFact(facts, 'policyholder_first_name', 'Mike')
     seedFact(facts, 'annual_gross_revenue', 2500000)
     drafts.upsertProjection('c1', 'acord_125', { policyholder_first_name: 'Mike', annual_gross_revenue: 2500000 }, '2025-03-15T00:00:00Z')
   })
 
-  it('applies an edit, approves ALL form-bound facts, and enqueues one outbox row', () => {
+  it('applies an edit, approves ALL form-bound facts, and the EDIT reaches the outbox payload', () => {
     const res = rc.approveForm('c1', 'acord_125', { edits: { annual_gross_revenue: 2800000 }, by: 'sarah' })
     // edited fact reflects new value + approved
     expect(JSON.parse(facts.byField('c1', 'annual_gross_revenue')[0]!.reviewed_value_json!)).toBe(2800000)
     // an untouched, form-bound fact is ALSO approved
     expect(facts.byField('c1', 'policyholder_first_name')[0]!.review_status).toBe('approved')
-    // outbox enqueued + wake fired
+    // the correction actually lands in the projected draft AND the outbox payload (not the stale 2.5M)
+    expect(JSON.parse(outbox.get(res.outboxId)!.payload_json).annual_gross_revenue).toBe(2800000)
+    expect(JSON.parse(drafts.byId(res.draftId)!.projected_json).annual_gross_revenue).toBe(2800000)
     expect(outbox.get(res.outboxId)!.status).toBe('pending')
     expect(wake).toHaveBeenCalledOnce()
+  })
+
+  it('ripples a shared-field edit to a filled OTHER form as a new needs_review revision', () => {
+    // employee_count_full_time is bound in BOTH 125 and 126.
+    seedFact(facts, 'employee_count_full_time', 35)
+    const d126 = drafts.upsertProjection('c1', 'acord_126', { employee_count_full_time: 35 }, '2025-03-15T00:00:00Z')
+    drafts.approve(d126.id, 'sarah', '2025-03-15T00:00:00Z')
+    drafts.markFilled(d126.id, 'pdf/126', '2025-03-15T00:01:00Z') // 126 already filled
+    // Now edit the shared field while approving 125.
+    rc.approveForm('c1', 'acord_125', { edits: { employee_count_full_time: 40 }, by: 'sarah' })
+    const cur126 = drafts.current('c1', 'acord_126')!
+    expect(cur126.revision).toBe(2)                       // new revision created
+    expect(cur126.status).toBe('needs_review')            // must be re-reviewed
+    expect(drafts.byId(d126.id)!.status).toBe('filled')   // old 126 stays filled (immutable)
+    expect(drafts.byId(d126.id)!.superseded_by_revision).toBe(2)
   })
 
   it('re-approving a filled form supersedes it onto a new revision', () => {
@@ -1993,11 +2103,13 @@ import type { OutboxRepo } from '../db/repos/outbox.js'
 import type { ConflictsRepo, ConflictRow } from '../db/repos/conflicts.js'
 import type { FormType } from '../schema/profile.js'
 import { renderForm, reverseResolve } from '../forms/renderers.js'
+import { STATIC_BINDINGS } from '../forms/bindings.js'
+import { selectCurrentFact } from '../profile/factSelector.js'
 import { contentHash } from '../util/hash.js'
 
 export interface ReviewDeps {
   db: DB; facts: FactsRepo; drafts: DraftsRepo; outbox: OutboxRepo; conflicts: ConflictsRepo
-  clock: Clock; onEnqueued?: () => void
+  clock: Clock; formTypes: FormType[]; onEnqueued?: () => void
 }
 export interface ApproveOpts { edits?: Record<string, unknown>; by?: string }
 export interface ApproveResult { draftId: string; revision: number; outboxId: string }
@@ -2016,7 +2128,13 @@ export class ReviewClient {
       const fact = profilePath ? currentFacts.get(profilePath) : undefined
       return {
         formFieldPath, value: mapping[formFieldPath],
-        provenance: fact ? { quote: fact.evidence_quote, span: fact.evidence_span_start !== null ? [fact.evidence_span_start, fact.evidence_span_end] : null, confidence: fact.confidence, presence: fact.presence, review_status: fact.review_status } : null,
+        provenance: fact ? {
+          quote: fact.evidence_quote,
+          span: fact.evidence_span_start !== null ? [fact.evidence_span_start, fact.evidence_span_end] : null,
+          confidence: fact.confidence, presence: fact.presence, review_status: fact.review_status,
+          // the composite reviewers care about: a human signed off on leaving this blank
+          approved_blank: fact.review_status === 'approved' && fact.presence !== 'present',
+        } : null,
       }
     })
     return { draft, fields }
@@ -2036,13 +2154,16 @@ export class ReviewClient {
       const bindings = drafts.getBindings(current.id)
 
       // 1. Resolve + apply edits (array paths via per-draft bindings, scalars via static).
+      //    Edit lands on the CURRENT fact (selectCurrentFact), not an arbitrary row.
+      const editedPaths: string[] = []
       for (const [formFieldPath, value] of Object.entries(opts.edits ?? {})) {
         const profilePath = reverseResolve(formType, formFieldPath, bindings)
         if (!profilePath) throw new Error(`unbound edit: ${formFieldPath}`)
         const cands = facts.byField(customerId, profilePath).filter(f => f.superseded_by === null)
-        const target = cands[0]
+        const target = selectCurrentFact(cands)
         if (!target) throw new Error(`no fact for ${profilePath}`)
         facts.markApproved(target.id, JSON.stringify(value), by, now)
+        editedPaths.push(profilePath)
       }
 
       // 2. Approve EVERY form-bound current fact (not just edits).
@@ -2075,6 +2196,23 @@ export class ReviewClient {
 
       // 5. Enqueue the fill.
       const outboxId = outbox.enqueue(customerId, formType, draftRow.revision, mapping, hash, now)
+
+      // 6. Shared-field ripple: any OTHER form that reads an edited profile path and is
+      //    already approved/filled gets a new needs_review revision (never mutated in place).
+      if (editedPaths.length) {
+        for (const other of this.d.formTypes) {
+          if (other === formType) continue
+          const reads = STATIC_BINDINGS[other].some(b => editedPaths.includes(b.profile_field_path))
+          if (!reads) continue
+          const otherDraft = drafts.current(customerId, other)
+          if (!otherDraft || (otherDraft.status !== 'approved' && otherDraft.status !== 'filled')) continue
+          const r = renderForm(other, fresh)
+          const rev = drafts.newRevision(customerId, other, r.mapping, now)
+          drafts.saveBindings(rev.id, r.fieldBindings)
+          // left as needs_review — a shared change must be re-reviewed on the other form
+        }
+      }
+
       return { draftId: draftRow.id, revision: draftRow.revision, outboxId }
     })
 
@@ -2325,6 +2463,9 @@ export class SourcesRepo {
   get(id: string): SourceRow | undefined {
     return this.db.prepare('SELECT * FROM sources WHERE id=?').get(id) as SourceRow | undefined
   }
+  existsById(id: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM sources WHERE id=?').get(id)
+  }
   existsByChecksum(checksum: string): boolean {
     return !!this.db.prepare('SELECT 1 FROM sources WHERE checksum=?').get(checksum)
   }
@@ -2519,8 +2660,13 @@ export function buildWebhookApp(deps: WebhookDeps): FastifyInstance {
     const b = req.body as { customer_id: string; source: { id: string; type: string; date: string; content: string } }
     if (!b?.customer_id || !b?.source?.content) return reply.code(400).send({ error: 'bad payload' })
 
+    // Idempotent ingest: a re-delivered source.id is a duplicate regardless of content
+    // (a genuine correction arrives as a NEW source with its own id). Checksum catches an
+    // id-less exact re-delivery. Either way we never PK-collide.
     const checksum = contentHash({ customer_id: b.customer_id, id: b.source.id, content: b.source.content })
-    if (sources.existsByChecksum(checksum)) return reply.code(200).send({ deduped: true })
+    if (sources.existsById(b.source.id) || sources.existsByChecksum(checksum)) {
+      return reply.code(200).send({ deduped: true })
+    }
 
     const now = deps.clock.now()
     const jobId = newId()
@@ -2556,6 +2702,7 @@ import { MemoryBlobStore } from './blob/blobStore.js'
 import { AiSdkLlmClient, MockLlmClient } from './extraction/llmClient.js'
 import { Processor } from './worker/processor.js'
 import { OutboxWorker } from './worker/outboxWorker.js'
+import { ReviewClient } from './review/reviewClient.js'
 import type { FormType } from './schema/profile.js'
 
 const clock = new SystemClock()
@@ -2574,6 +2721,14 @@ const processor = new Processor({
 const outboxWorker = new OutboxWorker({
   db, outbox: new OutboxRepo(db), drafts: new DraftsRepo(db), blob,
   lease: new LeaseClaimer(db, 'outbox'), clock, workerId: 'fill-1',
+})
+
+// The human-review surface. onEnqueued is the spec's PRIMARY wake-on-commit path:
+// an approval nudges the fill worker immediately (the poll below is only the backstop).
+export const reviewClient = new ReviewClient({
+  db, facts: new FactsRepo(db), drafts: new DraftsRepo(db), outbox: new OutboxRepo(db),
+  conflicts: new ConflictsRepo(db), clock, formTypes,
+  onEnqueued: () => { void outboxWorker.drainOnce() },
 })
 
 // Adaptive backstop poll (wake-on-commit calls drainOnce directly elsewhere).
@@ -2678,7 +2833,7 @@ describe('end-to-end pipeline', () => {
 
     const facts = new FactsRepo(db), drafts = new DraftsRepo(db), outbox = new OutboxRepo(db), conflicts = new ConflictsRepo(db)
     const blob = new MemoryBlobStore()
-    const rc = new ReviewClient({ db, facts, drafts, outbox, conflicts, clock, onEnqueued: () => {} })
+    const rc = new ReviewClient({ db, facts, drafts, outbox, conflicts, clock, formTypes: [...formTypes], onEnqueued: () => {} })
 
     // 2. Human approves the form (revenue currently 2.5M).
     const approved = rc.approveForm('c1', 'acord_125', { by: 'sarah' })
@@ -2742,7 +2897,25 @@ git commit -m "test: end-to-end pipeline incl. correction/conflict path"
 - Webhook 202 + dedupe → Task 16. ✅
 - Out-of-order/correction multi-transcript → Task 17. ✅
 
-**Gaps intentionally deferred (noted, not built):** ACORD 126 has only the shared employee-count bindings wired (enough to prove DRY + shared-field ripple); extending both forms to every `schema.md` field is mechanical binding-table entries. The shared-field ripple across two *filled* forms is covered structurally by Task 13's supersession logic; a dedicated 125↔126 ripple test can be added when 126's bindings are fleshed out.
+**Gaps intentionally deferred (noted, not built):** see the "Explicit Scope / Deferrals"
+section at the top — 126-specific fields and five repeated collections are not wired
+(mechanical to add). The **cross-form shared-field ripple IS implemented and tested**
+(Task 13, step 6 + the ripple test) via the shared `employee_count_*` bindings — this was a
+review finding that has been fixed.
+
+### Post-review fixes applied (independent audit)
+
+An independent reviewer audited this plan against the spec; all findings were verified and
+resolved here:
+
+- **#1 (HIGH)** — `renderForm` now uses `effectiveValueJson` (`reviewed_value_json ?? value_json`), so human edits reach the projected draft **and** the outbox payload; asserted in Task 13.
+- **#2 (HIGH)** — cross-form shared-field ripple implemented in `approveForm` step 6 (+ test).
+- **#3 (HIGH)** — extractor flattens fixed nested objects (`mailing_address.*`) into leaf facts matching the bindings (+ test).
+- **#5 (MED)** — deterministic `factIdFor` + `INSERT OR IGNORE` makes reprocessing idempotent (+ test).
+- **#6 (MED)** — edits target `selectCurrentFact`, not `cands[0]`.
+- **#9/#10/#11/#12/#13/#14 (LOW)** — removed the tautological review-status branch; implemented `FactsRepo.supersede`; wired `ReviewClient` + wake-on-commit in `server.ts`; surfaced `approved_blank` in `getDraft`; normalized-match returns a `null` span (not `[0,0]`); webhook dedupes by `source.id`.
+- **#7 (spec)** — the spec's "changed natural key auto-resolves via registry" overclaim was removed; a changed key now correctly yields a new item surfaced for human merge.
+- **Not built (documented):** reviewer-set `not_applicable` action (#12 setter) — `approved_blank` is surfaced read-side; the setter is a small extension listed under Deferrals.
 
 **Placeholder scan:** No TBD/TODO; every code step has complete code. The one explicit "both arms equal" branch in Task 9 is documented as intentional, not a placeholder.
 
