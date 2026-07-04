@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import fixture from '../fixtures/llm/coastal_v1.json'
-import { MockLlmClient } from '../../src/extraction/llmClient.js'
+import { buildPrompt, MockLlmClient } from '../../src/extraction/llmClient.js'
 
 describe('MockLlmClient', () => {
   it('returns a schema-validated envelope from the canned fixture, without any network call', async () => {
@@ -16,6 +16,14 @@ describe('MockLlmClient', () => {
     const malformed = { fein: { value: '12-3456789', presence: 'present', confidence: 0.9, evidence: null } }
     const llm = new MockLlmClient(malformed)
     await expect(llm.extract('irrelevant')).rejects.toThrow()
+  })
+})
+
+describe('prompt injection', () => {
+  it('builds the runtime prompt from an injected template with a transcript placeholder', () => {
+    const prompt = buildPrompt('Prompt v7: {{transcript}}', 'insured owns a cafe')
+
+    expect(prompt).toBe('Prompt v7: insured owns a cafe')
   })
 })
 
