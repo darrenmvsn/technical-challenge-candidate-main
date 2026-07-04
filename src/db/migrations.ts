@@ -5,15 +5,22 @@
  *
  * Finite-state columns carry a `CHECK` constraint (AGENTS.md invariant #11) mirroring the
  * enums in `src/schema/profile.ts` / `src/schema/forms.ts`:
- *   - facts.presence        -> presenceValues
- *   - facts.match_quality   -> MatchQuality
- *   - facts.review_status   -> ReviewStatus
+ *   - extracted_field_candidates.presence      -> presenceValues
+ *   - extracted_field_candidates.match_quality -> MatchQuality
+ *   - field_review_versions.action             -> ReviewAction
  *   - processing_jobs.status -> pending|processing|done|dead
  *   - outbox.status          -> pending|processing|done|dead|cancelled
  *   - form_drafts.status     -> needs_review|approved|filled
  *   - form_drafts.form_type / outbox.form_type -> FormType
- *   - conflicts.status       -> unresolved|resolved
+ *   - field_conflicts.status -> unresolved|resolved
  *   - sources.status         -> received|resolved|identity_needs_review|dead
+ *
+ * AGENTS.md invariant #7 (rewritten by this ticket): `extracted_field_candidates` stores ONLY
+ * immutable machine/source evidence -- no human-review columns. Human decisions are immutable
+ * rows in `field_review_versions`, one monotonically-increasing `version` per (customer_id,
+ * field_path). The current canonical value is computed by overlaying the latest review version
+ * on the machine-selected candidate (see `src/profile/candidateSelector.ts`), not stored as a
+ * mutable column on the candidate row.
  *
  * `collection_items.collection` is intentionally left unconstrained: the spec never defines a
  * closed set for it (collections are an open, mechanically-extensible set per the scope
@@ -54,22 +61,44 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_claim ON processing_jobs(status, next_attempt_at);
 
-CREATE TABLE IF NOT EXISTS facts (
-  id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, field_path TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS extracted_field_candidates (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL,
+  field_path TEXT NOT NULL,
   value_json TEXT,
   presence TEXT NOT NULL
     CHECK (presence IN ('present','missing','needs_follow_up','not_applicable')),
   confidence REAL NOT NULL,
-  evidence_quote TEXT, evidence_span_start INTEGER, evidence_span_end INTEGER,
+  evidence_quote TEXT,
+  evidence_span_start INTEGER,
+  evidence_span_end INTEGER,
   match_quality TEXT NOT NULL
     CHECK (match_quality IN ('exact','normalized','ambiguous','none')),
-  source_id TEXT NOT NULL, source_date TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  source_date TEXT NOT NULL,
   extracted_at TEXT NOT NULL,
-  review_status TEXT NOT NULL DEFAULT 'needs_review'
-    CHECK (review_status IN ('needs_review','approved','conflict')),
-  reviewed_value_json TEXT, reviewed_by TEXT, reviewed_at TEXT, superseded_by TEXT
+  superseded_by TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_facts_current ON facts(customer_id, field_path, superseded_by);
+CREATE INDEX IF NOT EXISTS idx_candidates_current
+  ON extracted_field_candidates(customer_id, field_path, superseded_by);
+
+CREATE TABLE IF NOT EXISTS field_review_versions (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL,
+  field_path TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  candidate_id TEXT NOT NULL,
+  value_json TEXT,
+  presence TEXT NOT NULL
+    CHECK (presence IN ('present','missing','needs_follow_up','not_applicable')),
+  action TEXT NOT NULL
+    CHECK (action IN ('approved','edited','accepted_conflict','approved_blank')),
+  reviewed_by TEXT NOT NULL,
+  reviewed_at TEXT NOT NULL,
+  UNIQUE(customer_id, field_path, version)
+);
+CREATE INDEX IF NOT EXISTS idx_review_versions_latest
+  ON field_review_versions(customer_id, field_path, version DESC);
 
 CREATE TABLE IF NOT EXISTS collection_items (
   id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, collection TEXT NOT NULL,
@@ -106,14 +135,24 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_claim ON outbox(status, next_attempt_at);
 
-CREATE TABLE IF NOT EXISTS conflicts (
-  id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, field_path TEXT NOT NULL,
-  current_fact_id TEXT NOT NULL, conflicting_fact_id TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS field_conflicts (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL,
+  field_path TEXT NOT NULL,
+  current_candidate_id TEXT NOT NULL,
+  conflicting_candidate_id TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'unresolved'
     CHECK (status IN ('unresolved','resolved')),
-  resolved_by TEXT, resolved_at TEXT, created_at TEXT NOT NULL
+  resolved_by_review_version_id TEXT,
+  resolved_by TEXT,
+  resolved_at TEXT,
+  created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_conflicts_customer_status ON conflicts(customer_id, status);
+CREATE INDEX IF NOT EXISTS idx_field_conflicts_customer_status
+  ON field_conflicts(customer_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_field_conflicts_open_unique
+  ON field_conflicts(customer_id, conflicting_candidate_id)
+  WHERE status = 'unresolved';
 
 CREATE TABLE IF NOT EXISTS customer_identity_signals (
   id TEXT PRIMARY KEY,

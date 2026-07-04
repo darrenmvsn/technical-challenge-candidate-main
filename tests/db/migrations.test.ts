@@ -19,16 +19,95 @@ describe('migrate', () => {
     for (const t of [
       'sources',
       'processing_jobs',
-      'facts',
+      'extracted_field_candidates',
+      'field_review_versions',
       'collection_items',
       'form_drafts',
       'draft_field_bindings',
       'outbox',
-      'conflicts',
+      'field_conflicts',
       'customers',
     ]) {
       expect(names).toContain(t)
     }
+  })
+
+  it('creates extracted candidates, review versions, and field conflicts tables', () => {
+    const db = openDb()
+    migrate(db)
+    const names = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all()
+      .map((r) => (r as SqliteMasterRow).name)
+    expect(names).toContain('extracted_field_candidates')
+    expect(names).toContain('field_review_versions')
+    expect(names).toContain('field_conflicts')
+  })
+
+  it('does not keep human review columns on extracted candidates', () => {
+    const db = openDb()
+    migrate(db)
+    const columns = db
+      .prepare('PRAGMA table_info(extracted_field_candidates)')
+      .all()
+      .map((r) => (r as { name: string }).name)
+    expect(columns).not.toContain('review_status')
+    expect(columns).not.toContain('reviewed_value_json')
+    expect(columns).not.toContain('reviewed_by')
+    expect(columns).not.toContain('reviewed_at')
+  })
+
+  it('field_review_versions enforces per-field monotonically unique versions', () => {
+    const db = openDb()
+    migrate(db)
+    db.prepare(
+      `INSERT INTO extracted_field_candidates
+        (id, customer_id, field_path, value_json, presence, confidence, match_quality, source_id, source_date, extracted_at)
+        VALUES ('cand1', 'c1', 'annual_gross_revenue', '2500000', 'present', 1, 'exact', 's1', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')`
+    ).run()
+    db.prepare(
+      `INSERT INTO field_review_versions
+        (id, customer_id, field_path, version, candidate_id, value_json, presence, action, reviewed_by, reviewed_at)
+        VALUES ('rv1', 'c1', 'annual_gross_revenue', 1, 'cand1', '2500000', 'present', 'approved', 'sarah', '2025-01-02T00:00:00Z')`
+    ).run()
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO field_review_versions
+            (id, customer_id, field_path, version, candidate_id, value_json, presence, action, reviewed_by, reviewed_at)
+            VALUES ('rv2', 'c1', 'annual_gross_revenue', 1, 'cand1', '2500000', 'present', 'approved', 'sarah', '2025-01-02T00:00:00Z')`
+        )
+        .run()
+    ).toThrow()
+  })
+
+  it('field_conflicts allows only one unresolved conflict per conflicting candidate', () => {
+    const db = openDb()
+    migrate(db)
+    db.prepare(
+      `INSERT INTO field_conflicts
+        (id, customer_id, field_path, current_candidate_id, conflicting_candidate_id, status, created_at)
+        VALUES ('conf1', 'c1', 'annual_gross_revenue', 'old', 'new', 'unresolved', '2025-01-02T00:00:00Z')`
+    ).run()
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO field_conflicts
+            (id, customer_id, field_path, current_candidate_id, conflicting_candidate_id, status, created_at)
+            VALUES ('conf2', 'c1', 'annual_gross_revenue', 'old', 'new', 'unresolved', '2025-01-02T00:00:00Z')`
+        )
+        .run()
+    ).toThrow()
+    db.prepare(`UPDATE field_conflicts SET status='resolved' WHERE id='conf1'`).run()
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO field_conflicts
+            (id, customer_id, field_path, current_candidate_id, conflicting_candidate_id, status, created_at)
+            VALUES ('conf3', 'c1', 'annual_gross_revenue', 'old', 'new', 'unresolved', '2025-01-03T00:00:00Z')`
+        )
+        .run()
+    ).not.toThrow()
   })
 
   it('is idempotent', () => {
@@ -50,13 +129,13 @@ describe('migrate', () => {
     }
   })
 
-  it('rejects an invalid presence value on facts via CHECK constraint', () => {
+  it('rejects an invalid presence value on extracted_field_candidates via CHECK constraint', () => {
     const db = openDb()
     migrate(db)
     expect(() =>
       db
         .prepare(
-          `INSERT INTO facts (id, customer_id, field_path, value_json, presence, confidence, match_quality, source_id, source_date, extracted_at)
+          `INSERT INTO extracted_field_candidates (id, customer_id, field_path, value_json, presence, confidence, match_quality, source_id, source_date, extracted_at)
            VALUES ('f1','c1','x', null, 'bogus', 0.5, 'none', 's1', '2026-01-01', '2026-01-01T00:00:00.000Z')`
         )
         .run()
@@ -138,13 +217,13 @@ describe('migrate', () => {
     ).toThrow()
   })
 
-  it('rejects an invalid status on conflicts via CHECK constraint', () => {
+  it('rejects an invalid status on field_conflicts via CHECK constraint', () => {
     const db = openDb()
     migrate(db)
     expect(() =>
       db
         .prepare(
-          `INSERT INTO conflicts (id, customer_id, field_path, current_fact_id, conflicting_fact_id, status, created_at)
+          `INSERT INTO field_conflicts (id, customer_id, field_path, current_candidate_id, conflicting_candidate_id, status, created_at)
            VALUES ('cf1','c1','x','f1','f2','bogus','2026-01-01T00:00:00.000Z')`
         )
         .run()
@@ -157,8 +236,8 @@ describe('migrate', () => {
     expect(() =>
       db
         .prepare(
-          `INSERT INTO facts (id, customer_id, field_path, value_json, presence, confidence, match_quality, source_id, source_date, extracted_at, review_status)
-           VALUES ('f2','c1','x', null, 'missing', 0.5, 'none', 's1', '2026-01-01', '2026-01-01T00:00:00.000Z', 'needs_review')`
+          `INSERT INTO extracted_field_candidates (id, customer_id, field_path, value_json, presence, confidence, match_quality, source_id, source_date, extracted_at)
+           VALUES ('f2','c1','x', null, 'missing', 0.5, 'none', 's1', '2026-01-01', '2026-01-01T00:00:00.000Z')`
         )
         .run()
     ).not.toThrow()

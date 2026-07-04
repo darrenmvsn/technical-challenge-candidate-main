@@ -4,7 +4,6 @@ export const presenceValues = ['present', 'missing', 'needs_follow_up', 'not_app
 export const Presence = z.enum(presenceValues)
 export type Presence = z.infer<typeof Presence>
 
-export type ReviewStatus = 'needs_review' | 'approved' | 'conflict'
 export type MatchQuality = 'exact' | 'normalized' | 'ambiguous' | 'none'
 export type FormType = 'acord_125' | 'acord_126'
 
@@ -65,8 +64,15 @@ export const ExtractionEnvelope = z.object({
 })
 export type ExtractionEnvelope = z.infer<typeof ExtractionEnvelope>
 
-/** A persisted fact (one field of the canonical profile). */
-export interface Fact {
+export type ReviewAction = 'approved' | 'edited' | 'accepted_conflict' | 'approved_blank'
+
+/**
+ * One immutable piece of machine/source evidence for a field of the canonical profile.
+ * Carries NO human-review state — human decisions live only in `FieldReviewVersion`
+ * (AGENTS.md invariant #7, rewritten by this ticket: current value = candidate selection
+ * overlaid with the latest review version, not a review column on this row).
+ */
+export interface ExtractedFieldCandidate {
   id: string
   customer_id: string
   field_path: string          // scalar: "annual_gross_revenue"; item: "claims.{item_id}.amount"
@@ -80,9 +86,33 @@ export interface Fact {
   source_id: string
   source_date: string
   extracted_at: string
-  review_status: ReviewStatus
-  reviewed_value_json: string | null
-  reviewed_by: string | null
-  reviewed_at: string | null
   superseded_by: string | null
+}
+
+/** One immutable human review decision for a field, monotonically versioned per (customer, field_path). */
+export interface FieldReviewVersion {
+  id: string
+  customer_id: string
+  field_path: string
+  version: number
+  candidate_id: string
+  value_json: string | null
+  presence: Presence
+  action: ReviewAction
+  reviewed_by: string
+  reviewed_at: string
+}
+
+/** The computed current canonical value for a field: machine selection overlaid with the latest review version. */
+export interface CurrentFieldValue {
+  field_path: string
+  /** The machine-selected candidate by source_date > confidence > extracted_at. */
+  selected_candidate: ExtractedFieldCandidate
+  /** The candidate whose evidence supports value_json; equals selected_candidate when no review exists. */
+  value_candidate: ExtractedFieldCandidate
+  review: FieldReviewVersion | null
+  value_json: string | null
+  presence: Presence
+  review_status: 'needs_review' | 'approved'
+  approved_blank: boolean
 }
