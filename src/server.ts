@@ -11,6 +11,8 @@ import { ConflictsRepo } from './db/repos/conflicts.js'
 import { CollectionItemsRepo } from './db/repos/collectionItems.js'
 import { DraftsRepo } from './db/repos/drafts.js'
 import { OutboxRepo } from './db/repos/outbox.js'
+import { CustomerIdentityRepo } from './db/repos/customerIdentity.js'
+import { CustomerResolver } from './identity/customerResolver.js'
 import { LeaseClaimer } from './lease/leaseClaimer.js'
 import { LocalBlobStore } from './blob/blobStore.js'
 import { AiSdkLlmClient, MockLlmClient } from './extraction/llmClient.js'
@@ -90,10 +92,12 @@ export function startServer(env: NodeJS.ProcessEnv = process.env): ServerRuntime
   const blob = new LocalBlobStore(env.BLOB_PATH ?? 'data/blob')
   const llm = env.LLM_LIVE === '1' ? new AiSdkLlmClient() : new MockLlmClient({})
 
+  const identity = new CustomerIdentityRepo(db)
+  const resolver = new CustomerResolver(identity)
   const processor = new Processor({
     db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db), facts: new FactsRepo(db),
     conflicts: new ConflictsRepo(db), items: new CollectionItemsRepo(db), drafts: new DraftsRepo(db),
-    lease: new LeaseClaimer(db, 'processing_jobs'), llm, clock, workerId: 'proc-1', formTypes,
+    outbox: new OutboxRepo(db), lease: new LeaseClaimer(db, 'processing_jobs'), llm, resolver, clock, workerId: 'proc-1', formTypes,
   })
   const outboxWorker = new OutboxWorker({
     db, outbox: new OutboxRepo(db), drafts: new DraftsRepo(db), blob,

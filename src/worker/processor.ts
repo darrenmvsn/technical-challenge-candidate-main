@@ -7,16 +7,20 @@ import type { FactsRepo } from '../db/repos/facts.js'
 import type { ConflictsRepo } from '../db/repos/conflicts.js'
 import type { CollectionItemsRepo } from '../db/repos/collectionItems.js'
 import type { DraftsRepo } from '../db/repos/drafts.js'
+import type { OutboxRepo } from '../db/repos/outbox.js'
 import type { LeaseClaimer } from '../lease/leaseClaimer.js'
 import type { LlmClient } from '../extraction/llmClient.js'
 import type { FormType } from '../schema/profile.js'
+import { ExtractionEnvelope } from '../schema/profile.js'
+import { CustomerResolver } from '../identity/customerResolver.js'
 import { extractFacts } from '../extraction/extractor.js'
 import { reconcile } from '../profile/reconciler.js'
 import { renderForm } from '../forms/renderers.js'
 
 export interface ProcessorDeps {
   db: DB; sources: SourcesRepo; jobs: ProcessingJobsRepo; facts: FactsRepo; conflicts: ConflictsRepo
-  items: CollectionItemsRepo; drafts: DraftsRepo; lease: LeaseClaimer; llm: LlmClient
+  items: CollectionItemsRepo; drafts: DraftsRepo; outbox: OutboxRepo; lease: LeaseClaimer; llm: LlmClient
+  resolver: CustomerResolver
   clock: Clock; workerId: string; formTypes: FormType[]; leaseMs?: number; batch?: number; maxAttempts?: number
 }
 
@@ -27,11 +31,23 @@ const BACKOFF_MS = [5_000, 30_000, 120_000, 600_000]
 /**
  * Ordering per job (AGENTS.md #12): claim (fenced, via `LeaseClaimer` on `processing_jobs`) ->
  * `llm.extract` OUTSIDE any transaction (the only async/network work in this worker) -> ONE
- * transaction that atomically {registers collection items, inserts facts, reconciles/detects
- * conflicts, re-projects every form draft + its bindings, and fence-completes the job}. If the
+ * transaction that atomically {stores the extraction, resolves the customer identity, registers
+ * collection items, inserts facts, reconciles/detects conflicts, re-projects every form draft +
+ * its bindings, and fence-completes the job}. Identity resolution (`CustomerResolver.resolve`)
+ * runs INSIDE this transaction — it performs its own DB writes (customer + identity signals +
+ * resolution row), and better-sqlite3 nests them via SAVEPOINTs, so they are atomic with the
+ * fact/draft writes: a customer is never created without its facts, and vice versa. If the
  * fenced `complete()` returns false (lease lost to another worker), we throw to roll the WHOLE
  * transaction back — nothing above it persists — and the row is left processing until its lease
  * expires and it is reclaimed and redone cleanly.
+ *
+ * Identity is resolved from the transcript, not carried on the job: a source ingested BEFORE its
+ * customer is known (`customer_id` null) is resolved here. An ambiguous/absent hard identity
+ * signal parks the source at `identity_needs_review` and completes the job WITHOUT writing any
+ * customer-scoped facts. A source whose `customer_id` was already set (the manual identity-review
+ * attach path, Task 6) skips the automatic resolver and persists under the reviewer's choice. A
+ * stored `extraction_json` is reused (re-validated, no second LLM call) so a requeue after review
+ * — or any retry — is cheap and side-effect-free.
  *
  * Deviation from the brief's literal reference code (documented per task instructions, watching
  * for "domain writes committing before/independently of the fence"): the reference `drainOnce`
@@ -43,11 +59,7 @@ const BACKOFF_MS = [5_000, 30_000, 120_000, 600_000]
  * projection/fenced-completion). Running `extractFacts` outside the transaction meant that write
  * auto-committed immediately, independent of whether the fence later succeeded — so a lost lease
  * would roll back facts/drafts/job-completion but leave a NEW collection_items row behind,
- * silently violating the all-or-nothing invariant. Proof of the bug (revert-and-fail): moving
- * `extractFacts` back out to its original position and re-running
- * `tests/worker/processor.test.ts` "persistence + job completion are atomic ..." fails on
- * `expect(new CollectionItemsRepo(db).findId('c1','claims','2023|workers_comp')).toBeUndefined()`
- * — the row exists despite the fence returning false. The fix moves `extractFacts` inside
+ * silently violating the all-or-nothing invariant. The fix keeps `extractFacts` inside
  * `persistAndComplete`, after the LLM call: the ONLY thing left outside the transaction is the
  * `await this.d.llm.extract(...)` call itself. Also fixed inline `new Date(...)` backoff math to
  * use the `addMs` clock helper (AGENTS.md #3 — date arithmetic must live in `clock.ts`, not
@@ -69,34 +81,57 @@ export class Processor {
         if (!source) { this.d.lease.complete(id, lock_token); continue }
         const { content: transcript } = JSON.parse(source.raw_json) as SourcePayload
 
-        // The LLM call is the ONLY async/network work, and it runs OUTSIDE any transaction.
-        const env = await this.d.llm.extract(transcript)
+        // Reuse a stored extraction (manual identity-review requeue) — NO second LLM call.
+        // Otherwise extract now; the LLM call is the ONLY async/network work, OUTSIDE any transaction.
+        const env = source.extraction_json != null
+          ? ExtractionEnvelope.parse(JSON.parse(source.extraction_json))
+          : await this.d.llm.extract(transcript)
 
         const persistAndComplete = this.d.db.transaction(() => {
-          // extractFacts registers new collection items (a DB write via resolveItemId) as a
-          // side effect — it must run INSIDE this transaction, not before it, so that write
-          // rolls back along with everything else if the fence below fails.
+          // Store extraction so any retry/requeue reuses it instead of re-calling the LLM.
+          this.d.sources.saveExtraction(source.id, JSON.stringify(env))
+
+          // Resolve identity BEFORE any customer-scoped write.
+          let customerId: string
+          if (source.customer_id != null) {
+            // Manual identity-review attach path: reviewer already chose the customer.
+            customerId = source.customer_id
+            this.d.sources.attachCustomer(source.id, customerId, this.d.clock.now())
+          } else {
+            const res = this.d.resolver.resolve(env, { sourceId: source.id, now: this.d.clock.now(), transcript })
+            if (res.status === 'needs_review') {
+              this.d.sources.markIdentityNeedsReview(source.id)
+              if (!this.d.lease.complete(id, lock_token)) throw new Error('lost lease')
+              return
+            }
+            customerId = res.customerId
+            this.d.sources.attachCustomer(source.id, customerId, this.d.clock.now())
+          }
+
+          // extractFacts registers new collection items (a DB write via resolveItemId) — must run
+          // INSIDE this transaction so it rolls back with everything else if the fence fails.
           const facts = extractFacts(env, {
-            customerId: job.customer_id, sourceId: source.id, sourceDate: source.source_date,
+            customerId, sourceId: source.id, sourceDate: source.source_date,
             transcript, clock: this.d.clock, itemsRepo: this.d.items,
           })
           this.d.facts.insertMany(facts)
           reconcile({
             db: this.d.db, facts: this.d.facts, conflicts: this.d.conflicts, clock: this.d.clock,
-            customerId: job.customer_id, formTypes: this.d.formTypes,
+            customerId, formTypes: this.d.formTypes,
           })
-          const currentFacts = this.d.facts.currentMap(job.customer_id)
+          const currentFacts = this.d.facts.currentMap(customerId)
           for (const ft of this.d.formTypes) {
             const { mapping, fieldBindings } = renderForm(ft, currentFacts)
-            const draft = this.d.drafts.upsertProjection(job.customer_id, ft, mapping, this.d.clock.now())
+            const before = this.d.drafts.current(customerId, ft)
+            const draft = this.d.drafts.upsertProjection(customerId, ft, mapping, this.d.clock.now())
             this.d.drafts.saveBindings(draft.id, fieldBindings)
+            if (before && before.id === draft.id && before.projected_json !== draft.projected_json) {
+              const pending = this.d.outbox.pendingForForm(customerId, ft)
+              if (pending) this.d.outbox.cancel(pending.id)
+            }
           }
-          // Fenced: false if we lost the lease. Throw to roll the whole transaction back so
-          // another worker's run is the single source of truth — never double-applied.
           if (!this.d.lease.complete(id, lock_token)) throw new Error('lost lease')
         })
-        // On commit failure (lost lease OR a real persistence error) back off. fail() is
-        // fenced, so a lost-lease rollback is a harmless no-op; a real error gets retried.
         try { persistAndComplete(); done++ } catch { this.fail(id, lock_token, job.attempts, now) }
       } catch {
         this.fail(id, lock_token, job.attempts, now)
