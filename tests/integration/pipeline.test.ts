@@ -104,13 +104,29 @@ describe('end-to-end pipeline: ingest -> extract -> review -> approve -> fill, t
     expect(firstBlobJson.mapping.annual_gross_revenue).toBe(2500000) // the blob really holds the approved value
 
     // ==== 3. Correcting transcript arrives: revenue 2.5M -> 2.8M, payroll (unbound) -> 1.75M. ====
+    // Synthetic follow-up call text (no second real transcript is provided in the repo). It
+    // contains coastal_v2's two evidence quotes verbatim so locateEvidence resolves REAL spans.
+    const res2Content = 'One correction from last time: revenue was actually 2.8 million, and payroll was 1,750,000.'
     clock.set('2025-03-16T09:00:00Z')
     const res2 = await app.inject({
       method: 'POST', url: '/webhook/transcript',
-      payload: { customer_id: 'c1', source: { id: 'src_002', type: 'call_transcript', date: '2025-03-15T10:00:00Z', content: 'One correction from last time: revenue was actually 2.8 million, and payroll was 1,750,000.' } },
+      payload: { customer_id: 'c1', source: { id: 'src_002', type: 'call_transcript', date: '2025-03-15T10:00:00Z', content: res2Content } },
     })
     expect(res2.statusCode).toBe(202)
     expect(await processor(llm).drainOnce()).toBe(1)
+
+    // Evidence-genuineness for the CORRECTION transcript too (not just T1): both changed facts
+    // from src_002 must resolve to a REAL evidence span, so a silent locateEvidence regression on
+    // source 2 fails this acceptance gate. Both quotes appear verbatim in the synthetic
+    // correction text, so the genuine expected quality is 'exact' (must NOT be 'none'/'ambiguous').
+    const revenueV2 = facts.byField('c1', 'annual_gross_revenue').find(f => f.source_id === 'src_002')!
+    expect(revenueV2.match_quality).toBe('exact')
+    expect(revenueV2.evidence_span_start).not.toBeNull()
+    expect(res2Content.slice(revenueV2.evidence_span_start!, revenueV2.evidence_span_end!)).toBe(revenueV2.evidence_quote)
+    const payrollV2 = facts.byField('c1', 'annual_payroll').find(f => f.source_id === 'src_002')!
+    expect(payrollV2.match_quality).toBe('exact')
+    expect(payrollV2.evidence_span_start).not.toBeNull()
+    expect(res2Content.slice(payrollV2.evidence_span_start!, payrollV2.evidence_span_end!)).toBe(payrollV2.evidence_quote)
 
     // ==== PROPERTY 4: the disagreement surfaces a CONFLICT row, approval-gated. ====
     // annual_gross_revenue's CURRENT fact was already approved (2.5M) when the newer,
