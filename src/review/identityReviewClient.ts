@@ -17,9 +17,11 @@ export interface IdentityReviewOpts { by: string }
 
 export type IdentityReviewResolution =
   | { status: 'resolved'; jobId: string }
-  | { status: 'needs_review'; reason: 'hard_identity_signal_conflict' }
+  | { status: 'needs_review'; reason: 'hard_identity_signal_conflict' | 'customer_not_found' | 'source_already_resolved' }
 
 interface RawSourcePayload { content: string }
+
+class SourceAlreadyResolvedError extends Error {}
 
 /**
  * Human one-click "attach this ambiguous source to that customer" path. A source parked by
@@ -61,19 +63,30 @@ export class IdentityReviewClient {
     const matchedSignalsJson = JSON.stringify(signals)
 
     try {
-      const jobId = identity.transaction(() => {
+      return identity.transaction(() => {
+        if (!identity.customerExists(customerId)) {
+          identity.insertResolution({
+            sourceId, status: 'needs_review', customerId: null, reason: 'customer_not_found',
+            matchedSignalsJson, now, resolvedBy: opts.by, resolvedAt: now,
+          })
+          return { status: 'needs_review', reason: 'customer_not_found' }
+        }
         for (const signal of signals) identity.insertSignal(customerId, signal, sourceId, now)
-        sources.attachCustomer(sourceId, customerId, now)
+        if (!sources.attachCustomerForIdentityReview(sourceId, customerId, now)) {
+          throw new SourceAlreadyResolvedError()
+        }
         identity.insertResolution({
           sourceId, status: 'resolved', customerId, reason: 'manual_identity_review',
           matchedSignalsJson, now, resolvedBy: opts.by, resolvedAt: now,
         })
         const jid = newId()
         jobs.insert({ id: jid, source_id: sourceId, next_attempt_at: now, created_at: now })
-        return jid
+        return { status: 'resolved', jobId: jid }
       })
-      return { status: 'resolved', jobId }
     } catch (e) {
+      if (e instanceof SourceAlreadyResolvedError) {
+        return { status: 'needs_review', reason: 'source_already_resolved' }
+      }
       if (!(e instanceof IdentitySignalConflictError)) throw e
       // The transaction rolled back above: no signals, no attach, no job. Record the
       // conflict verdict as a single-row write, after rollback, so it isn't itself undone.

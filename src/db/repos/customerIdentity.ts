@@ -39,6 +39,10 @@ export class CustomerIdentityRepo {
     return id
   }
 
+  customerExists(customerId: string): boolean {
+    return this.db.prepare('SELECT 1 FROM customers WHERE id=?').get(customerId) !== undefined
+  }
+
   /**
    * Idempotent per (customer_id, signal_type, signal_value): a retried source re-inserting the
    * same signal for the same customer is a silent no-op. A hard signal (fein/email) that already

@@ -54,16 +54,28 @@ export function identitySignalsFromEnvelope(env: ExtractionEnvelope, transcript:
     return location.quality === 'exact' || location.quality === 'normalized'
   }
 
+  // Anti-hallucination guard for HARD signals (fein/email): the VALUE we key identity on — and
+  // can silently auto-merge two customers by — must itself be grounded in the transcript, not
+  // merely paired with a real evidence quote. verifyEvidence proves the LLM's evidence STRING is
+  // in the transcript; that is not enough on its own, because the value and the evidence are
+  // independent fields: a fabricated/transposed FEIN carrying a real-but-unrelated quote (e.g.
+  // evidence "Coastal Roofing LLC") would otherwise pass and drive an auto-resolve (invariant #13).
+  // So a hard signal is emitted only when its value ALSO locates in the transcript (exact/normalized).
+  const verifyValue = (value: string): boolean => {
+    const location = locateEvidence(transcript, value)
+    return location.quality === 'exact' || location.quality === 'normalized'
+  }
+
   // fein -> digits only; keep only exactly 9 digits; strength hard
   const fein = presentString(env.fein)
-  if (fein && verifyEvidence(fein.evidence)) {
+  if (fein && verifyEvidence(fein.evidence) && verifyValue(fein.value)) {
     const digits = fein.value.replace(/\D+/g, '')
     if (digits.length === 9) signals.push({ type: 'fein', value: digits, strength: 'hard' })
   }
 
   // email -> lowercase trim; keep only local@domain-shaped values; strength hard
   const email = presentString(env.policyholder_email)
-  if (email && verifyEvidence(email.evidence)) {
+  if (email && verifyEvidence(email.evidence) && verifyValue(email.value)) {
     const normalized = email.value.trim().toLowerCase()
     if (EMAIL_SHAPE.test(normalized)) signals.push({ type: 'email', value: normalized, strength: 'hard' })
   }

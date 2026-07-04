@@ -70,6 +70,22 @@ describe('CustomerResolver', () => {
     expect(identity.findCustomersBySignal('fein', '987654321')).toEqual([])
   })
 
+  it('does not ground a hard signal whose VALUE is absent from the transcript even when its evidence quote is present', () => {
+    // Value/evidence decoupling: the evidence quote ('Coastal Roofing LLC') is a real transcript
+    // phrase, but the FEIN digits ('98-7654321') appear nowhere in the transcript. A fabricated
+    // value carrying a real-but-unrelated quote must NOT ground a hard signal — otherwise it could
+    // silently auto-resolve/auto-create a customer off a hallucinated identifier (invariant #13).
+    const existing = identity.createCustomerWithSignals({ legalName: 'Existing', signals: [{ type: 'fein', value: '987654321', sourceId: 'seed' }], now: clock.now() })
+    const env = ExtractionEnvelope.parse({
+      fein: { value: '98-7654321', presence: 'present', confidence: 0.99, evidence: 'Coastal Roofing LLC' },
+    })
+    const result = resolver.resolve(env, { sourceId: 'src_decoupled', now: clock.now(), transcript })
+    // Must NOT silently merge this source into the pre-existing customer that owns 987654321.
+    expect(result.status).toBe('needs_review')
+    expect(result.customerId).toBeUndefined()
+    expect(identity.findCustomersBySignal('fein', '987654321')).toEqual([existing])
+  })
+
   it('does not auto-resolve or auto-create from business name/address alone', () => {
     const env = ExtractionEnvelope.parse({
       business_name: { value: 'Coastal Roofing LLC', presence: 'present', confidence: 0.95, evidence: 'Coastal Roofing LLC' },

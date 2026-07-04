@@ -22,6 +22,16 @@ describe('IdentityReviewClient', () => {
   let client: IdentityReviewClient
   const clock = new FixedClock('2025-03-12T10:31:00Z')
 
+  class StaleSourcesRepo extends SourcesRepo {
+    constructor(db: DB, private stale: SourceRow) {
+      super(db)
+    }
+
+    override get(id: string): SourceRow | undefined {
+      return id === this.stale.id ? this.stale : super.get(id)
+    }
+  }
+
   beforeEach(() => {
     db = openDb()
     migrate(db)
@@ -139,6 +149,53 @@ describe('IdentityReviewClient', () => {
     expect(new SourcesRepo(db).get('src_conflict')!.customer_id).toBeNull()
     expect(db.prepare("SELECT COUNT(*) n FROM processing_jobs WHERE source_id='src_conflict' AND status='pending'").get()).toMatchObject({ n: 0 })
     expect(identity.findCustomersBySignal('fein', '123456789')).toEqual([existingCustomerId])
+  })
+
+  it('does not attach or requeue when the chosen customer does not exist', () => {
+    seedSource({
+      id: 'src_unknown_customer',
+      status: 'identity_needs_review',
+      customer_id: null,
+      raw_json: JSON.stringify({ id: 'src_unknown_customer', type: 'call_transcript', date: '2025-03-12T10:30:00Z', participants: ['Sarah Chen (Agent)', 'Mike Torres'], content: '12-3456789' }),
+      extraction_json: JSON.stringify({
+        fein: { value: '12-3456789', presence: 'present', confidence: 0.95, evidence: '12-3456789' },
+      }),
+    })
+
+    const result = client.resolveSourceToCustomer('src_unknown_customer', 'missing_customer', { by: 'sarah' })
+
+    expect(result).toMatchObject({ status: 'needs_review', reason: 'customer_not_found' })
+    expect(new SourcesRepo(db).get('src_unknown_customer')!.customer_id).toBeNull()
+    expect(db.prepare("SELECT COUNT(*) n FROM processing_jobs WHERE source_id='src_unknown_customer' AND status='pending'").get()).toMatchObject({ n: 0 })
+    expect(identity.findCustomersBySignal('fein', '123456789')).toEqual([])
+  })
+
+  it('does not overwrite a source already attached by another reviewer after a stale read', () => {
+    const firstCustomerId = seedCustomer()
+    const secondCustomerId = seedCustomer()
+    seedSource({
+      id: 'src_double_attach',
+      status: 'identity_needs_review',
+      customer_id: null,
+      raw_json: JSON.stringify({ id: 'src_double_attach', type: 'call_transcript', date: '2025-03-12T10:30:00Z', participants: ['Sarah Chen (Agent)', 'Mike Torres'], content: 'Coastal Roofing LLC' }),
+      extraction_json: JSON.stringify({
+        business_name: { value: 'Coastal Roofing LLC', presence: 'present', confidence: 0.95, evidence: 'Coastal Roofing LLC' },
+      }),
+    })
+    const staleSource = new SourcesRepo(db).get('src_double_attach')!
+    expect(new SourcesRepo(db).attachCustomerForIdentityReview('src_double_attach', firstCustomerId, clock.now())).toBe(true)
+    const staleClient = new IdentityReviewClient({
+      sources: new StaleSourcesRepo(db, staleSource),
+      jobs: new ProcessingJobsRepo(db),
+      identity,
+      clock,
+    })
+
+    const result = staleClient.resolveSourceToCustomer('src_double_attach', secondCustomerId, { by: 'bob' })
+
+    expect(result).toMatchObject({ status: 'needs_review', reason: 'source_already_resolved' })
+    expect(new SourcesRepo(db).get('src_double_attach')!.customer_id).toBe(firstCustomerId)
+    expect(db.prepare("SELECT COUNT(*) n FROM processing_jobs WHERE source_id='src_double_attach' AND status='pending'").get()).toMatchObject({ n: 0 })
   })
 
   it('processes a reviewer-attached source under the chosen customer instead of looping to identity review', async () => {

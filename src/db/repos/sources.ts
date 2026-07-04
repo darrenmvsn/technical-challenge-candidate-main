@@ -25,6 +25,18 @@ export class SourcesRepo {
   attachCustomer(sourceId: string, customerId: string, _now: string): void {
     this.db.prepare(`UPDATE sources SET customer_id=?, status='resolved' WHERE id=?`).run(customerId, sourceId)
   }
+  /**
+   * Reviewer attach must be a fenced state transition: only a source that is still awaiting
+   * identity review and has no customer can be claimed by this reviewer action.
+   */
+  attachCustomerForIdentityReview(sourceId: string, customerId: string, _now: string): boolean {
+    const info = this.db.prepare(
+      `UPDATE sources
+       SET customer_id=?, status='resolved'
+       WHERE id=? AND status='identity_needs_review' AND customer_id IS NULL`
+    ).run(customerId, sourceId)
+    return info.changes === 1
+  }
   /** Persist the extraction envelope so a retry/requeue reuses it instead of re-calling the LLM. */
   saveExtraction(sourceId: string, extractionJson: string): void {
     this.db.prepare('UPDATE sources SET extraction_json=? WHERE id=?').run(extractionJson, sourceId)
