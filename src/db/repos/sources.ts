@@ -40,14 +40,27 @@ export class SourcesRepo {
  * and does NOT create duplicate sources/jobs"). The fix checks `existsById`/`existsByChecksum`
  * inside the same transaction before writing and returns early (no-op) on either match — see
  * `tests/worker/processor.test.ts` "insertSourceAndJob (durable ingest)" for the proof.
+ *
+ * Task 16 addition: the return value reports whether THIS call actually performed the insert.
+ * The webhook route (`src/ingest/webhook.ts`) does its own `existsById`/`existsByChecksum`
+ * pre-check for the common sequential-redelivery case, but that pre-check is a
+ * check-THEN-insert race under concurrent requests: two requests for the same new source can
+ * both pass the pre-check before either has committed. Without this return value, the loser of
+ * that race would still call `insertSourceAndJob`, get no-op'd by the in-transaction dedupe
+ * below, yet the route would have no way to know that — and would (per the brief's literal
+ * handler) reply `202 { job_id }` for a job that was never inserted, a lying response. Because
+ * the in-transaction check+insert here is atomic (single `db.transaction`), `inserted` is a
+ * reliable signal of what actually happened; the route uses it, not the pre-check, to decide
+ * between `202` and the deduped `200`.
  */
-export function insertSourceAndJob(db: DB, args: { source: SourceRow; job: JobInsert }): void {
+export function insertSourceAndJob(db: DB, args: { source: SourceRow; job: JobInsert }): { inserted: boolean } {
   const sources = new SourcesRepo(db)
   const jobs = new ProcessingJobsRepo(db)
   const tx = db.transaction(() => {
-    if (sources.existsById(args.source.id) || sources.existsByChecksum(args.source.checksum)) return
+    if (sources.existsById(args.source.id) || sources.existsByChecksum(args.source.checksum)) return false
     sources.insert(args.source)
     jobs.insert(args.job)
+    return true
   })
-  tx()
+  return { inserted: tx() }
 }
