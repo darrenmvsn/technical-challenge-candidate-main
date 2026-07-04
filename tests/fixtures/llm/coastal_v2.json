@@ -1,0 +1,4 @@
+{
+  "annual_gross_revenue": { "value": 2800000, "presence": "present", "confidence": 0.9, "evidence": "revenue was actually 2.8 million" },
+  "annual_payroll": { "value": 1750000, "presence": "present", "confidence": 0.9, "evidence": "payroll was 1,750,000" }
+}
