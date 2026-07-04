@@ -85,6 +85,15 @@ Source of truth for detail:
     fails, none of those domain writes may persist. The only async/network work in the
     processor is the LLM call before that transaction.
 
+13. **Raw transcript identity resolution.** The webhook payload does not contain `customer_id`.
+    Raw `sources` may be customerless, but customer-scoped tables (`facts` /
+    `extracted_field_candidates`, `collection_items`, `form_drafts`, `outbox`, conflicts) must
+    never receive rows until identity resolution has attached a stable `customer_id`. Identity
+    auto-resolution is exact-hard-signal-only (`fein`, `email`); supporting signals (`phone`,
+    `business_name_state`, `mailing_address`) never merge or create a customer by themselves,
+    and any ambiguous/fuzzy/supporting-only match stops at `identity_needs_review` rather than
+    silently merging two customers.
+
 ---
 
 ## Style / structure
