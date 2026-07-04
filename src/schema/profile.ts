@@ -41,6 +41,9 @@ const Address = z.object({ street: z.string(), city: z.string(), state: z.string
 export const ExtractionEnvelope = z.object({
   policyholder_first_name: envelopeField(z.string()).optional(),
   policyholder_last_name: envelopeField(z.string()).optional(),
+  business_name: envelopeField(z.string()).optional(),
+  business_phone: envelopeField(z.string()).optional(),
+  policyholder_email: envelopeField(z.string()).optional(),
   dba_name: envelopeField(z.string()).optional(),
   entity_type: envelopeField(z.enum(['LLC', 'Corporation', 'SoleProprietor', 'Partnership'])).optional(),
   fein: envelopeField(z.string()).optional(),

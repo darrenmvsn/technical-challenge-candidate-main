@@ -35,4 +35,13 @@ describe('ExtractionEnvelope', () => {
     })
     expect(parsed.annual_gross_revenue?.presence).toBe('needs_follow_up')
   })
+  it('accepts identity fields used by customer resolution', () => {
+    const parsed = ExtractionEnvelope.parse({
+      business_name: { value: 'Coastal Roofing LLC', presence: 'present', confidence: 0.95, evidence: 'Coastal Roofing LLC' },
+      business_phone: { value: '910-555-0173', presence: 'present', confidence: 0.95, evidence: '910-555-0173' },
+      policyholder_email: { value: 'mike.torres@coastalroofing.com', presence: 'present', confidence: 0.95, evidence: 'mike.torres@coastalroofing.com' },
+    })
+    expect(parsed.business_name?.value).toBe('Coastal Roofing LLC')
+    expect(parsed.policyholder_email?.value).toBe('mike.torres@coastalroofing.com')
+  })
 })
