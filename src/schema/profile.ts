@@ -15,9 +15,16 @@ export type FormType = 'acord_125' | 'acord_126'
  * source of truth: `identitySignalsFromEnvelope` imports the same predicates so persistence and
  * identity resolution can never drift apart.
  */
+// Both predicates test the RAW value with anchored patterns (no trim/normalize/digit-count
+// leniency), so any value that passes is already clean enough to persist and render onto the
+// ACORD form. A digit-COUNT check would wrongly accept a labeled string like "FEIN 12-3456789"
+// (9 digits present) and persist it verbatim; the anchored shape rejects anything but the
+// identifier itself. Identity resolution re-normalizes these already-clean values into its own
+// signal keys — see identitySignalsFromEnvelope.
+const FEIN_SHAPE = /^\d{2}-?\d{7}$/           // e.g. "12-3456789" or "123456789" — nothing else
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-export const isWellFormedFein = (value: string): boolean => value.replace(/\D+/g, '').length === 9
-export const isWellFormedEmail = (value: string): boolean => EMAIL_SHAPE.test(value.trim().toLowerCase())
+export const isWellFormedFein = (value: string): boolean => FEIN_SHAPE.test(value)
+export const isWellFormedEmail = (value: string): boolean => EMAIL_SHAPE.test(value)
 
 /** A present-value format check applied by `envelopeField` only when `presence === 'present'`. */
 export interface PresentFormat<V> { check: (value: V) => boolean; message: string }
@@ -28,9 +35,12 @@ export interface PresentFormat<V> { check: (value: V) => boolean; message: strin
  * `superRefine` rejects a present/needs_follow_up/not_applicable field with null evidence,
  * and rejects a missing field carrying evidence — so the constraint can't be silently violated.
  *
- * `presentFormat` (optional) additionally rejects a `present` field whose non-null value fails a
- * format check (e.g. a malformed FEIN/email), so bad hard-identity values never reach candidates.
- * missing/needs_follow_up/not_applicable fields (null value) are unaffected.
+ * `presence === 'present'` additionally REQUIRES a non-null value — a present field with a null
+ * value is contradictory (nothing was actually extracted) and must never be persisted as a
+ * "present but empty" candidate. Only missing/needs_follow_up/not_applicable carry a null value.
+ *
+ * `presentFormat` (optional) additionally rejects a `present` field whose value fails a format
+ * check (e.g. a malformed FEIN/email), so bad hard-identity values never reach candidates.
  */
 export function envelopeField<T extends z.ZodTypeAny>(value: T, presentFormat?: PresentFormat<z.infer<T>>) {
   return z.object({
@@ -44,6 +54,9 @@ export function envelopeField<T extends z.ZodTypeAny>(value: T, presentFormat?: 
     }
     if (field.presence !== 'missing' && field.evidence === null) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['evidence'], message: "evidence is required unless presence is 'missing'" })
+    }
+    if (field.presence === 'present' && field.value === null) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['value'], message: "value is required when presence is 'present'" })
     }
     if (presentFormat && field.presence === 'present' && field.value !== null && !presentFormat.check(field.value as z.infer<T>)) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['value'], message: presentFormat.message })
