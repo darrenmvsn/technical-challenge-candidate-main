@@ -97,7 +97,13 @@ export class CustomerIdentityRepo {
     return tx()
   }
 
-  /** UPSERT on source_id — a re-resolution overwrites the prior verdict, never collides. */
+  /**
+   * UPSERT on source_id — a re-resolution overwrites the prior verdict, never collides.
+   * `resolvedBy`/`resolvedAt` are optional (default null): the automatic resolver (Task 4)
+   * omits them, so its rows stay `resolved_by=NULL, resolved_at=NULL`. The manual identity
+   * review client (Task 6) passes the reviewer + Clock timestamp for both the resolved and
+   * conflict-rollback verdicts.
+   */
   insertResolution(args: {
     sourceId: string
     status: 'resolved' | 'needs_review'
@@ -105,16 +111,20 @@ export class CustomerIdentityRepo {
     reason: string
     matchedSignalsJson: string
     now: string
+    resolvedBy?: string
+    resolvedAt?: string
   }): void {
     this.db.prepare(`
       INSERT INTO source_identity_resolutions
         (source_id, status, customer_id, reason, matched_signals_json, resolved_by, resolved_at, created_at)
-      VALUES (@sourceId, @status, @customerId, @reason, @matchedSignalsJson, NULL, NULL, @now)
+      VALUES (@sourceId, @status, @customerId, @reason, @matchedSignalsJson, @resolvedBy, @resolvedAt, @now)
       ON CONFLICT(source_id) DO UPDATE SET
         status = excluded.status,
         customer_id = excluded.customer_id,
         reason = excluded.reason,
-        matched_signals_json = excluded.matched_signals_json
+        matched_signals_json = excluded.matched_signals_json,
+        resolved_by = excluded.resolved_by,
+        resolved_at = excluded.resolved_at
     `).run({
       sourceId: args.sourceId,
       status: args.status,
@@ -122,6 +132,8 @@ export class CustomerIdentityRepo {
       reason: args.reason,
       matchedSignalsJson: args.matchedSignalsJson,
       now: args.now,
+      resolvedBy: args.resolvedBy ?? null,
+      resolvedAt: args.resolvedAt ?? null,
     })
   }
 }
