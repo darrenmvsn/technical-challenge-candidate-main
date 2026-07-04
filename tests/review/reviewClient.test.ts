@@ -140,10 +140,16 @@ describe('ReviewClient.approveForm', () => {
     expect(conflicts.get(c2.id)!.status).toBe('resolved')
     expect(conflicts.get(c2.id)!.resolved_by_review_version_id).toBe(latest.id)
 
-    // Documented current behavior: C1 (conflicting = B, the older superseded correction) is NOT
-    // touched by accepting D — this fix only resolves the conflict matching the accepted value,
-    // it does not auto-close unrelated older conflicts on the same field. That remains a dangling
-    // conflict until a reviewer/reconcile pass addresses it explicitly (out of scope here).
+    // Documented current behavior + KNOWN LIMITATION: C1 (conflicting = B, the older correction
+    // candidate) is NOT touched by accepting D — this fix only resolves the conflict whose
+    // conflicting candidate matches the accepted value. Under the current code there is NO path
+    // that ever clears C1: `approveForm` only resolves a value-matching conflict, and `reconcile`
+    // opens conflicts but never resolves them (after accepting D, the latest review points at D so
+    // reconcile short-circuits and never revisits B). So C1 stays unresolved indefinitely in the
+    // reviewer queue. Auto-closing stale stacked conflicts (or a manual resolve path) is a
+    // deliberately DEFERRED extension — the conflict-acceptance UI/queue-hygiene layer is out of
+    // scope for this lane (see delivery board Scope guardrails). This asserts the current, honest
+    // behavior; it is a queue-hygiene gap, not a data-integrity or silent-overwrite defect.
     expect(conflicts.get(c1.id)!.status).toBe('unresolved')
 
     // The accepted value did land in the outbox payload for this approval.
