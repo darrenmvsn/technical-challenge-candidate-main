@@ -107,4 +107,31 @@ CREATE TABLE IF NOT EXISTS conflicts (
   resolved_by TEXT, resolved_at TEXT, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_conflicts_customer_status ON conflicts(customer_id, status);
+
+CREATE TABLE IF NOT EXISTS customer_identity_signals (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL,
+  signal_type TEXT NOT NULL
+    CHECK (signal_type IN ('fein','email','phone','business_name_state','mailing_address')),
+  signal_value TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(customer_id, signal_type, signal_value)
+);
+CREATE INDEX IF NOT EXISTS idx_customer_identity_lookup
+  ON customer_identity_signals(signal_type, signal_value);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_identity_hard_unique
+  ON customer_identity_signals(signal_type, signal_value)
+  WHERE signal_type IN ('fein','email');
+
+CREATE TABLE IF NOT EXISTS source_identity_resolutions (
+  source_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK (status IN ('resolved','needs_review')),
+  customer_id TEXT,
+  reason TEXT NOT NULL,
+  matched_signals_json TEXT NOT NULL,
+  resolved_by TEXT,
+  resolved_at TEXT,
+  created_at TEXT NOT NULL
+);
 `
