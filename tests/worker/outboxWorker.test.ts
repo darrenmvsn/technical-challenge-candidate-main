@@ -106,6 +106,39 @@ describe('OutboxWorker.drainOnce', () => {
     expect(afterReproject.superseded_by_revision).toBe(reprojected.revision)
   })
 
+  it('T14: a superseded draft revision is completed in the outbox but NOT marked filled (stale-revision guard)', async () => {
+    const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
+    drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')
+    // Enqueue against revision N...
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, 'hash', '2025-03-16T00:00:00Z')
+
+    // ...then a reprojection races in before the worker runs, superseding revision N with a
+    // new revision N+1 (a filled draft would mint a new revision too, but here the current
+    // draft isn't filled yet, so upsertProjection overwrites it in place UNLESS we force a
+    // fresh revision via newRevision directly, matching "a reprojection raced in").
+    const superseded = drafts.newRevision('c1', 'acord_125', { fein: 'B' }, '2025-03-16T00:30:00Z')
+    expect(superseded.revision).toBe(d.revision + 1)
+    expect(drafts.current('c1', 'acord_125')!.revision).toBe(superseded.revision)
+
+    const n = await worker.drainOnce()
+
+    // The outbox row still completes (done) — the fenced lease claim/complete only cares about
+    // the outbox row's own token/status, not the draft's revision.
+    expect(n).toBe(1)
+    expect(outbox.get(oid)!.status).toBe('done')
+
+    // But the CURRENT draft (now at the superseded revision) must NOT be marked filled: the
+    // outbox row was enqueued against the stale revision `d.revision`, and
+    // `drafts.current(...).revision !== row.draft_revision`, so the worker's guard
+    // (`if (draft && draft.revision === row.draft_revision) markFilled(...)`) must skip the
+    // markFilled call — no stale fill onto a revision the outbox payload was never generated
+    // from.
+    const currentAfter = drafts.current('c1', 'acord_125')!
+    expect(currentAfter.revision).toBe(superseded.revision)
+    expect(currentAfter.status).not.toBe('filled')
+    expect(currentAfter.pdf_ref).toBeNull()
+  })
+
   it('backs off via addMs (clock-based, no inline Date math) on a retryable failure', async () => {
     const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
     drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')

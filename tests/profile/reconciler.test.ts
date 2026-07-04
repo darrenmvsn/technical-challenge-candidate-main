@@ -113,6 +113,33 @@ describe('reconcile', () => {
     expect(conflicts.listUnresolved('c1')).toHaveLength(0)
   })
 
+  it('CRITICAL: a materialized missing placeholder must never shadow a later-arriving real fact with an earlier source_date (AGENTS.md #7 tiebreak)', () => {
+    // Transcript A processed "now" (reconcile PROCESSING time) with `fein` absent -> reconcile
+    // materializes a `missing` fein placeholder. Before the fix, that placeholder's
+    // source_date was clock.now() (the recent processing time), which lexicographically beats
+    // the real fein fact's much-earlier source_date (an actual call/transcript date) under
+    // invariant #7's source_date tiebreak — so the empty placeholder would silently outrank
+    // and shadow the genuine extracted value.
+    reconcile({ db, facts, conflicts, clock, customerId: 'c1', formTypes: ['acord_125'] })
+    const placeholder = facts.byField('c1', 'fein')
+    expect(placeholder).toHaveLength(1)
+    expect(placeholder[0]!.presence).toBe('missing')
+
+    // A real, unapproved fein fact now arrives from a source dated well BEFORE the reconcile
+    // processing time above (2025-03-15, vs. the FixedClock's 2025-03-16 reconcile time).
+    facts.insertMany([
+      fact({
+        id: 'fein-real', field_path: 'fein', value_json: '12-3456789', presence: 'present',
+        review_status: 'needs_review', source_date: '2025-03-15T00:00:00Z', extracted_at: '2025-03-15T00:00:00Z',
+      }),
+    ])
+
+    const current = facts.currentMap('c1').get('fein')
+    expect(current, 'expected the real present fein fact to be current, not the missing placeholder').toBeDefined()
+    expect(current!.presence).toBe('present')
+    expect(current!.value_json).toBe('12-3456789')
+  })
+
   it('reconciling the SAME source twice yields an identical ledger overall (no dupes anywhere)', () => {
     facts.insertMany([
       fact({ id: 'a', review_status: 'approved', value_json: '2500000', source_date: '2025-03-12T00:00:00Z' }),

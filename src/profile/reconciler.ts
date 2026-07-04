@@ -13,6 +13,21 @@ export interface ReconcileCtx {
 }
 
 /**
+ * Sentinel `source_date` for materialized `missing` placeholder facts (fixes a Critical
+ * whole-branch-review finding: silent data loss). A materialized "missing" is not a dated
+ * observation — it is reconcile's bookkeeping that a bound field has no fact yet — so it must
+ * always LOSE the invariant-#7 source_date tiebreak to any real (present/needs_follow_up)
+ * fact, no matter how much later that real fact is discovered. Using `clock.now()` (the
+ * reconcile PROCESSING time) here was the bug: a recent processing timestamp lexicographically
+ * beats an older, real transcript/call `source_date`, so an empty placeholder could shadow a
+ * genuine extracted value. This sentinel is a valid-shaped ISO-8601 UTC string that sorts
+ * lexicographically before every real date, so it never wins the source_date comparison in
+ * `selectCurrentFact` (approval is still checked first, so an APPROVED missing fact is
+ * unaffected — approval outranks source_date regardless of this constant).
+ */
+export const MISSING_SOURCE_DATE = '0000-01-01T00:00:00.000Z'
+
+/**
  * Deviation from the brief's literal reference code (documented per task instructions):
  * the reference `reconcile()` ran the conflict-insert loop and the missing-fact
  * materialization as separate, unwrapped repo calls. AGENTS.md invariant #5 ("every write
@@ -57,7 +72,7 @@ export function reconcile(ctx: ReconcileCtx): void {
       missing.push({
         id: factIdFor(customerId, path, 'system'), customer_id: customerId, field_path: path, value_json: null,
         presence: 'missing', confidence: 0, evidence_quote: null, evidence_span_start: null,
-        evidence_span_end: null, match_quality: 'none', source_id: 'system', source_date: now,
+        evidence_span_end: null, match_quality: 'none', source_id: 'system', source_date: MISSING_SOURCE_DATE,
         extracted_at: now, review_status: 'needs_review', reviewed_value_json: null,
         reviewed_by: null, reviewed_at: null, superseded_by: null,
       })
