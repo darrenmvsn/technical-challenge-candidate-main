@@ -6,6 +6,12 @@ import { LeaseClaimer } from '../../src/lease/leaseClaimer.js'
 import { MemoryBlobStore, type BlobStore } from '../../src/blob/blobStore.js'
 import { OutboxWorker } from '../../src/worker/outboxWorker.js'
 import { FixedClock, addMs } from '../../src/clock.js'
+import { contentHash } from '../../src/util/hash.js'
+
+// Every row below enqueues the { fein: 'A' } payload for c1/acord_125, so its content_hash is
+// the one fillForm will derive (AGENTS.md #9). Production enqueues this matching hash via
+// approveForm; the worker now enforces the equality, so tests must seed the real value.
+const HASH = contentHash({ customerId: 'c1', formType: 'acord_125', mapping: { fein: 'A' } })
 
 describe('OutboxWorker.drainOnce', () => {
   let db: DB, outbox: OutboxRepo, drafts: DraftsRepo, blob: MemoryBlobStore, lease: LeaseClaimer, worker: OutboxWorker
@@ -21,7 +27,7 @@ describe('OutboxWorker.drainOnce', () => {
   it('fills a pending row and marks the draft filled', async () => {
     const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
     drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')
-    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, 'hash', '2025-03-16T00:00:00Z')
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, HASH, '2025-03-16T00:00:00Z')
     const n = await worker.drainOnce()
     expect(n).toBe(1)
     expect(outbox.get(oid)!.status).toBe('done')
@@ -31,7 +37,7 @@ describe('OutboxWorker.drainOnce', () => {
 
   it('a cancelled row does not get filled (fencing)', async () => {
     const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
-    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, 'hash', '2025-03-16T00:00:00Z')
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, HASH, '2025-03-16T00:00:00Z')
     outbox.cancel(oid) // superseded before the worker runs
     const n = await worker.drainOnce()
     expect(n).toBe(0)
@@ -41,7 +47,7 @@ describe('OutboxWorker.drainOnce', () => {
   it('completion+fill are atomic: if markFilled throws, outbox does NOT become done', async () => {
     const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
     drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')
-    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, 'hash', '2025-03-16T00:00:00Z')
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, HASH, '2025-03-16T00:00:00Z')
     const orig = drafts.markFilled.bind(drafts)
     ;(drafts as any).markFilled = () => { throw new Error('crash after complete()') } // deliberate failure injection: force the atomic commit to roll back after complete() would have run
     const n = await worker.drainOnce()
@@ -55,7 +61,7 @@ describe('OutboxWorker.drainOnce', () => {
   it('FORCED DOUBLE-RUN: a lost-lease crash between fillForm and commit, followed by a real retry, yields exactly ONE effective fill', async () => {
     const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
     drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')
-    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, 'hash', '2025-03-16T00:00:00Z')
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, HASH, '2025-03-16T00:00:00Z')
 
     const putKeys: string[] = []
     const realPut = blob.put.bind(blob)
@@ -110,7 +116,7 @@ describe('OutboxWorker.drainOnce', () => {
     const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
     drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')
     // Enqueue against revision N...
-    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, 'hash', '2025-03-16T00:00:00Z')
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, HASH, '2025-03-16T00:00:00Z')
 
     // ...then a reprojection races in before the worker runs, superseding revision N with a
     // new revision N+1 (a filled draft would mint a new revision too, but here the current
@@ -139,10 +145,35 @@ describe('OutboxWorker.drainOnce', () => {
     expect(currentAfter.pdf_ref).toBeNull()
   })
 
+  it('does NOT mark filled a draft reprojected to needs_review after enqueue (in-place approved window)', async () => {
+    const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
+    drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, HASH, '2025-03-16T00:00:00Z')
+
+    // A correcting transcript reprojects the approved-but-unfilled draft IN PLACE before the
+    // worker runs: SAME revision (so the revision guard alone would still pass), content changed,
+    // status reset to needs_review. This is the window the newRevision-based T14 test above does
+    // NOT exercise — without the status guard the stale payload would fill an unreviewed draft.
+    const reset = drafts.upsertProjection('c1', 'acord_125', { fein: 'B' }, '2025-03-16T00:10:00Z')
+    expect(reset.id).toBe(d.id)               // in place — same row and revision
+    expect(reset.revision).toBe(d.revision)
+    expect(reset.status).toBe('needs_review')
+
+    const n = await worker.drainOnce()
+    // The outbox row still completes (its blob is content-addressed and harmless), but the draft
+    // must NOT be marked filled: an unreviewed draft can never be stamped filled with the stale
+    // pre-correction payload. It waits for re-approval, which enqueues a fresh correct fill.
+    expect(n).toBe(1)
+    expect(outbox.get(oid)!.status).toBe('done')
+    const after = drafts.byId(d.id)!
+    expect(after.status).toBe('needs_review')
+    expect(after.pdf_ref).toBeNull()
+  })
+
   it('backs off via addMs (clock-based, no inline Date math) on a retryable failure', async () => {
     const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
     drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')
-    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, 'hash', '2025-03-16T00:00:00Z')
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, HASH, '2025-03-16T00:00:00Z')
     const failingBlob: BlobStore = { put: async () => { throw new Error('blob store down') }, get: async () => null }
     const w = new OutboxWorker({ db, outbox, drafts, blob: failingBlob, lease: new LeaseClaimer(db, 'outbox'), clock, workerId: 'w1' })
     const n = await w.drainOnce()
@@ -153,10 +184,22 @@ describe('OutboxWorker.drainOnce', () => {
     expect(row.next_attempt_at).toBe(addMs(clock.now(), 5_000))
   })
 
+  it('fails a row whose stored content_hash disagrees with the fill payload (AGENTS.md #9)', async () => {
+    const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
+    drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')
+    // A desynced row: content_hash claims one thing, the payload hashes to another. The worker
+    // must NOT mark it done/filled — the stored hash is the durable identity of the blob.
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, 'wrong-hash', '2025-03-16T00:00:00Z')
+    const n = await worker.drainOnce()
+    expect(n).toBe(0)
+    expect(outbox.get(oid)!.status).not.toBe('done')
+    expect(drafts.byId(d.id)!.status).not.toBe('filled')
+  })
+
   it('dead-letters once attempts reach maxAttempts', async () => {
     const d = drafts.upsertProjection('c1', 'acord_125', { fein: 'A' }, '2025-03-15T00:00:00Z')
     drafts.approve(d.id, 'sarah', '2025-03-16T00:00:00Z')
-    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, 'hash', '2025-03-16T00:00:00Z')
+    const oid = outbox.enqueue('c1', 'acord_125', d.revision, { fein: 'A' }, HASH, '2025-03-16T00:00:00Z')
     const failingBlob: BlobStore = { put: async () => { throw new Error('blob store down') }, get: async () => null }
     const w = new OutboxWorker({ db, outbox, drafts, blob: failingBlob, lease: new LeaseClaimer(db, 'outbox'), clock, workerId: 'w1', maxAttempts: 1 })
     const n = await w.drainOnce()

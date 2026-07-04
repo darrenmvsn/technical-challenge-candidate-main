@@ -44,7 +44,14 @@ export class OutboxWorker {
         // payload_json is the NESTED fill mapping (README fill_form shape), enqueued at approve time.
         const mapping = JSON.parse(row.payload_json) as FillMapping
         // External I/O (PDF generation) happens OUTSIDE any DB transaction — AGENTS.md #5/#12.
-        const { pdf_ref } = await fillForm(row.customer_id, row.form_type as FormType, mapping, this.d.blob)
+        const { pdf_ref, content_hash } = await fillForm(row.customer_id, row.form_type as FormType, mapping, this.d.blob)
+        // AGENTS.md #9: the stored outbox content_hash MUST equal the hash fillForm derives for
+        // this exact nested payload. It is guaranteed by construction (approveForm hashed the same
+        // fillMapping), but enforce it so an enqueue bug or data repair that desynced the two fails
+        // the fill loudly (backoff -> dead-letter) instead of marking a mislabeled blob 'done'.
+        if (content_hash !== row.content_hash) {
+          throw new Error(`content_hash mismatch: stored ${row.content_hash} != derived ${content_hash}`)
+        }
         // Commit `outbox=done` AND `draft=filled` atomically. If the process dies between
         // them, neither lands: the row is still 'processing', its lease expires, and it is
         // re-fetched — never stranded as a done outbox row over an unfilled draft.
@@ -53,7 +60,16 @@ export class OutboxWorker {
         const commit = this.d.db.transaction(() => {
           if (!this.d.lease.complete(id, lock_token)) throw new Error('lost lease')
           const draft = this.d.drafts.current(row.customer_id, row.form_type as FormType)
-          if (draft && draft.revision === row.draft_revision) this.d.drafts.markFilled(draft.id, pdf_ref, this.d.clock.now())
+          // Only mark filled if the draft is STILL the exact one this fill was enqueued for AND
+          // still approved. A correcting transcript can reproject an approved-but-unfilled draft
+          // IN PLACE (same revision, reset to needs_review) between approve and fill — the
+          // revision check alone would pass and wrongly mark an unreviewed draft filled with the
+          // stale payload. Requiring status='approved' closes that window (incl. a row already
+          // claimed mid-fill); the reset draft then waits for re-approval, which enqueues a fresh
+          // correct fill. The outbox row still completes (its blob is content-addressed/harmless).
+          if (draft && draft.revision === row.draft_revision && draft.status === 'approved') {
+            this.d.drafts.markFilled(draft.id, pdf_ref, this.d.clock.now())
+          }
         })
         try {
           commit(); filled++

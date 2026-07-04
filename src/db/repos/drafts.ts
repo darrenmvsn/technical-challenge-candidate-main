@@ -36,15 +36,25 @@ export class DraftsRepo {
    *    mint a new needs_review revision and mark the old row superseded. Routed through
    *    newRevision() so `superseded_by_revision` is always set — never a dangling filled row
    *    with `superseded_by_revision IS NULL` (which would break the single-current invariant).
-   *  - current is needs_review/approved (not yet filled) → overwrite its projection in place
-   *    and reset to needs_review; new data invalidates any prior approval, so it re-reviews.
+   *  - current is needs_review/approved (not yet filled), projection UNCHANGED → no-op: return the
+   *    row untouched. A reprocess that yields byte-identical facts must NOT reset an approved draft
+   *    to needs_review, bump updated_at, or disturb an in-flight fill for that same content — doing
+   *    so would withhold an otherwise-valid, already-approved fill until a re-approval that merely
+   *    re-confirms identical data. Byte comparison is sound: `projected_json` was written via
+   *    `JSON.stringify(mapping)` and renderForm projects the same facts to the same key order, so
+   *    identical content serializes identically.
+   *  - current is needs_review/approved (not yet filled), projection CHANGED → overwrite its
+   *    projection in place and reset to needs_review; new data invalidates any prior approval, so
+   *    it re-reviews.
    */
   upsertProjection(customerId: string, formType: FormType, mapping: FormMapping, now: string): DraftRow {
     const cur = this.current(customerId, formType)
     if (!cur) return this.insert(customerId, formType, 1, mapping, now)
     if (cur.status === 'filled') return this.newRevision(customerId, formType, mapping, now)
+    const projected = JSON.stringify(mapping)
+    if (projected === cur.projected_json) return cur
     this.db.prepare('UPDATE form_drafts SET projected_json=?, status=?, approved_by=NULL, approved_at=NULL, updated_at=? WHERE id=?')
-      .run(JSON.stringify(mapping), 'needs_review', now, cur.id)
+      .run(projected, 'needs_review', now, cur.id)
     return this.byId(cur.id)!
   }
 
