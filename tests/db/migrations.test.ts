@@ -63,14 +63,50 @@ describe('migrate', () => {
     ).toThrow()
   })
 
+  it('allows sources and jobs before customer identity is resolved', () => {
+    const db = openDb()
+    migrate(db)
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO sources
+            (id,type,source_date,received_at,raw_json,checksum,status)
+            VALUES ('src_001','call_transcript','2025-03-12T10:30:00Z','2025-03-12T10:31:00Z','{}','h','received')`
+        )
+        .run()
+    ).not.toThrow()
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO processing_jobs
+            (id,source_id,status,attempts,next_attempt_at,created_at)
+            VALUES ('job_001','src_001','pending',0,'2025-03-12T10:31:00Z','2025-03-12T10:31:00Z')`
+        )
+        .run()
+    ).not.toThrow()
+  })
+
   it('rejects an invalid status on processing_jobs via CHECK constraint', () => {
     const db = openDb()
     migrate(db)
     expect(() =>
       db
         .prepare(
-          `INSERT INTO processing_jobs (id, source_id, customer_id, status, next_attempt_at, created_at)
-           VALUES ('j1','s1','c1','bogus','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')`
+          `INSERT INTO processing_jobs (id, source_id, status, next_attempt_at, created_at)
+           VALUES ('j1','s1','bogus','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')`
+        )
+        .run()
+    ).toThrow()
+  })
+
+  it('rejects an invalid status on sources via CHECK constraint', () => {
+    const db = openDb()
+    migrate(db)
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO sources (id,type,source_date,received_at,raw_json,checksum,status)
+           VALUES ('s_bogus','call_transcript','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z','{}','hb','bogus')`
         )
         .run()
     ).toThrow()

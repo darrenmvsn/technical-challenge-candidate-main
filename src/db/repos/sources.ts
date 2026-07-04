@@ -2,19 +2,36 @@ import type { DB } from '../sqlite.js'
 import { ProcessingJobsRepo, type JobInsert } from './jobs.js'
 
 export interface SourceRow {
-  id: string; customer_id: string; type: string; source_date: string; received_at: string
-  raw_json: string; checksum: string; status?: string
+  id: string; customer_id: string | null; type: string; source_date: string; received_at: string
+  raw_json: string; extraction_json?: string | null; checksum: string
+  status?: 'received' | 'resolved' | 'identity_needs_review' | 'dead'
 }
 
 export class SourcesRepo {
   constructor(private db: DB) {}
   insert(row: SourceRow): void {
-    this.db.prepare(`INSERT INTO sources (id,customer_id,type,source_date,received_at,raw_json,checksum,status)
-      VALUES (@id,@customer_id,@type,@source_date,@received_at,@raw_json,@checksum,@status)`)
-      .run({ ...row, status: row.status ?? 'received' })
+    // Bind extraction_json explicitly (defaulting to null) so a SourceRow that carries the field
+    // is accepted AND a row that omits it is too: better-sqlite3 rejects a bound object whose keys
+    // don't line up 1:1 with the statement's named params. New sources always start with a null
+    // extraction — the processor fills it after the (post-ingest) LLM extraction.
+    this.db.prepare(`INSERT INTO sources (id,customer_id,type,source_date,received_at,raw_json,extraction_json,checksum,status)
+      VALUES (@id,@customer_id,@type,@source_date,@received_at,@raw_json,@extraction_json,@checksum,@status)`)
+      .run({ ...row, extraction_json: row.extraction_json ?? null, status: row.status ?? 'received' })
   }
   get(id: string): SourceRow | undefined {
     return this.db.prepare('SELECT * FROM sources WHERE id=?').get(id) as SourceRow | undefined
+  }
+  /** Attach a resolved customer to a source and flip it to 'resolved'. */
+  attachCustomer(sourceId: string, customerId: string, _now: string): void {
+    this.db.prepare(`UPDATE sources SET customer_id=?, status='resolved' WHERE id=?`).run(customerId, sourceId)
+  }
+  /** Persist the extraction envelope so a retry/requeue reuses it instead of re-calling the LLM. */
+  saveExtraction(sourceId: string, extractionJson: string): void {
+    this.db.prepare('UPDATE sources SET extraction_json=? WHERE id=?').run(extractionJson, sourceId)
+  }
+  /** Park a source for human identity review (ambiguous/absent hard identity signal). */
+  markIdentityNeedsReview(sourceId: string): void {
+    this.db.prepare(`UPDATE sources SET status='identity_needs_review' WHERE id=?`).run(sourceId)
   }
   existsById(id: string): boolean {
     return !!this.db.prepare('SELECT 1 FROM sources WHERE id=?').get(id)

@@ -13,11 +13,15 @@
  *   - form_drafts.status     -> needs_review|approved|filled
  *   - form_drafts.form_type / outbox.form_type -> FormType
  *   - conflicts.status       -> unresolved|resolved
+ *   - sources.status         -> received|resolved|identity_needs_review|dead
  *
- * `sources.status` and `collection_items.collection` are intentionally left unconstrained:
- * the spec never defines a closed set for either (sources.status is always written as
- * 'received'; collections are an open, mechanically-extensible set per the scope
- * guardrails) — inventing enum values for them would be speculative, not spec-derived.
+ * `collection_items.collection` is intentionally left unconstrained: the spec never defines a
+ * closed set for it (collections are an open, mechanically-extensible set per the scope
+ * guardrails) — inventing enum values would be speculative, not spec-derived. `sources.status`
+ * IS a closed set (a source moves received -> resolved / identity_needs_review, or dead) now
+ * that identity resolution happens after ingest, so it carries a CHECK constraint (invariant #11).
+ * `customer_id` on sources is nullable: a source is ingested BEFORE its customer identity is
+ * resolved (the processor resolves it later), so it has no customer at insert time.
  *
  * Queue/current-read hot paths get supporting indexes: job/outbox claim queries filter on
  * (status, next_attempt_at); the "current fact"/"current draft" reads filter on
@@ -31,14 +35,17 @@ CREATE TABLE IF NOT EXISTS customers (
 );
 
 CREATE TABLE IF NOT EXISTS sources (
-  id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, type TEXT NOT NULL,
+  id TEXT PRIMARY KEY, customer_id TEXT, type TEXT NOT NULL,
   source_date TEXT NOT NULL, received_at TEXT NOT NULL, raw_json TEXT NOT NULL,
-  checksum TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'received'
+  extraction_json TEXT,
+  checksum TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'received'
+    CHECK (status IN ('received','resolved','identity_needs_review','dead'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_checksum_unique ON sources(checksum);
 
 CREATE TABLE IF NOT EXISTS processing_jobs (
-  id TEXT PRIMARY KEY, source_id TEXT NOT NULL, customer_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY, source_id TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','processing','done','dead')),
   attempts INTEGER NOT NULL DEFAULT 0,
