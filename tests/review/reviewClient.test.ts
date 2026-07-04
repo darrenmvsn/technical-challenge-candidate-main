@@ -106,6 +106,50 @@ describe('ReviewClient.approveForm', () => {
     expect(conflicts.get(conflict.id)!.resolved_by_review_version_id).toBe(latest.id)
   })
 
+  it('stacked conflicts on the same field: accepting the newest correction resolves the matching conflict, not the first one', () => {
+    // v1 review over the original 2.5M candidate.
+    rc.approveForm('c1', 'acord_125', { by: 'sarah' })
+    // First correction arrives (2.8M) -> reconcile opens C1 (conflicting = this candidate).
+    candidates.insertMany([
+      candidate({ id: 'candidate-b', field_path: 'annual_gross_revenue', value_json: '2800000', source_date: '2025-03-15T00:00:00Z' }),
+    ])
+    reconcile({ db, candidates, reviews: reviewVersions, conflicts, clock, customerId: 'c1', formTypes: ['acord_125'] })
+    // A second, even-newer correction arrives (3.0M) -> reconcile opens C2 WITHOUT closing C1,
+    // because the older machine candidate B is never resolved/superseded by this reconcile pass.
+    candidates.insertMany([
+      candidate({ id: 'candidate-d', field_path: 'annual_gross_revenue', value_json: '3000000', source_date: '2025-03-16T00:00:00Z' }),
+    ])
+    reconcile({ db, candidates, reviews: reviewVersions, conflicts, clock, customerId: 'c1', formTypes: ['acord_125'] })
+
+    const openOnField = conflicts.listUnresolved('c1').filter(c => c.field_path === 'annual_gross_revenue')
+    expect(openOnField).toHaveLength(2) // both C1 (conflicting=B) and C2 (conflicting=D) are unresolved
+    const c1 = openOnField.find(c => c.conflicting_candidate_id === 'candidate-b')!
+    const c2 = openOnField.find(c => c.conflicting_candidate_id === 'candidate-d')!
+    expect(c1).toBeTruthy()
+    expect(c2).toBeTruthy()
+
+    // Reviewer accepts the NEWEST correction (D, 3.0M) — not B, not the stale 2.5M.
+    const res = rc.approveForm('c1', 'acord_125', { edits: { annual_gross_revenue: 3000000 }, by: 'sarah' })
+
+    const latest = reviewVersions.latestByField('c1', 'annual_gross_revenue')!
+    expect(latest.action).toBe('accepted_conflict')
+    expect(latest.candidate_id).toBe('candidate-d') // resolves to D, NOT A or B
+    expect(latest.value_json).toBe(JSON.stringify(3000000))
+
+    // C2 (the conflict whose conflicting candidate IS D) is the one resolved by this accept.
+    expect(conflicts.get(c2.id)!.status).toBe('resolved')
+    expect(conflicts.get(c2.id)!.resolved_by_review_version_id).toBe(latest.id)
+
+    // Documented current behavior: C1 (conflicting = B, the older superseded correction) is NOT
+    // touched by accepting D — this fix only resolves the conflict matching the accepted value,
+    // it does not auto-close unrelated older conflicts on the same field. That remains a dangling
+    // conflict until a reviewer/reconcile pass addresses it explicitly (out of scope here).
+    expect(conflicts.get(c1.id)!.status).toBe('unresolved')
+
+    // The accepted value did land in the outbox payload for this approval.
+    expect(JSON.parse(outbox.get(res.outboxId)!.payload_json).annual_gross_revenue).toBe(3000000)
+  })
+
   it('ripples a shared-field edit to a filled OTHER form as a new needs_review revision', () => {
     // employee_count_full_time is bound in BOTH 125 and 126.
     seedCandidate(candidates, 'employee_count_full_time', 35)

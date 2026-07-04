@@ -34,11 +34,6 @@ export interface FieldProvenance {
 export interface DraftField { formFieldPath: string; value: unknown; provenance: FieldProvenance | null }
 export interface DraftView { draft: DraftRow; fields: DraftField[] }
 
-/** Pure equality check for two nullable JSON-encoded values (used to detect "edit == the conflicting candidate"). */
-function jsonEquals(a: string | null, b: string | null): boolean {
-  return a === b
-}
-
 /**
  * Human-in-the-loop core of the pipeline. `getDraft` builds the FLAT review surface (what a
  * reviewer edits) with per-field provenance; `approveForm` writes the NESTED fill mapping (what
@@ -111,11 +106,17 @@ export class ReviewClient {
         const currentField = profile.get(profilePath)
         if (!currentField) throw new Error(`no candidate for ${profilePath}`)
 
-        const openConflict = openConflicts.find(c => c.field_path === profilePath)
-        const conflictingCandidate = openConflict ? candidates.get(openConflict.conflicting_candidate_id) : undefined
         const editValueJson = JSON.stringify(value)
+        // A field can hold MULTIPLE unresolved conflicts at once (the open-conflict unique index
+        // is on conflicting_candidate_id, not field_path — reconcile opens a fresh conflict per
+        // newer disagreeing candidate without closing older ones). Select by BOTH field_path AND
+        // the conflicting candidate's value matching the edit, so a stacked conflict resolves the
+        // RIGHT row instead of always the first-opened one.
+        const openConflict = openConflicts.find(c =>
+          c.field_path === profilePath &&
+          candidates.get(c.conflicting_candidate_id)?.value_json === editValueJson)
 
-        if (openConflict && conflictingCandidate && jsonEquals(editValueJson, conflictingCandidate.value_json)) {
+        if (openConflict) {
           const version = reviewVersions.insertVersion({
             customerId, fieldPath: profilePath, candidateId: openConflict.conflicting_candidate_id,
             valueJson: editValueJson, presence: 'present', action: 'accepted_conflict',
