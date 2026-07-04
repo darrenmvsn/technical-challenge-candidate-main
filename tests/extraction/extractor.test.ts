@@ -31,14 +31,15 @@ describe('extractFacts', () => {
     expect(amount.value_json).toBe('30000')
   })
 
-  it('forces needs_review when a present value has an unlocatable quote', () => {
+  it('flags an unlocatable quote as match_quality none for reviewers', () => {
     const env = ExtractionEnvelope.parse({
       fein: { value: '99-9999999', presence: 'present', confidence: 0.9, evidence: 'not in the transcript at all' },
     })
     const facts = extractFacts(env, { customerId: 'c1', sourceId: 's1', sourceDate: '2025-03-12T10:30:00Z', transcript, clock, itemsRepo })
     const fein = facts.find(f => f.field_path === 'fein')!
+    // Machine candidates carry no review state (that lives in field_review_versions); an
+    // unlocatable quote is surfaced to reviewers via match_quality 'none'.
     expect(fein.match_quality).toBe('none')
-    expect(fein.review_status).toBe('needs_review')
   })
 
   it('flattens a fixed nested object into leaf facts matching the form bindings', () => {

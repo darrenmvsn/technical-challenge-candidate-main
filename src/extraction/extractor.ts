@@ -1,6 +1,6 @@
 import type { Clock } from '../clock.js'
 import type { CollectionItemsRepo } from '../db/repos/collectionItems.js'
-import type { ExtractionEnvelope, Fact, EnvelopeField } from '../schema/profile.js'
+import type { ExtractionEnvelope, ExtractedFieldCandidate, EnvelopeField } from '../schema/profile.js'
 import { locateEvidence } from './evidenceMatcher.js'
 import { resolveItemId } from '../profile/collectionIdentity.js'
 import { factIdFor } from '../util/hash.js'
@@ -14,8 +14,8 @@ export interface ExtractCtx {
   itemsRepo: CollectionItemsRepo
 }
 
-/** Build one Fact at a leaf field_path with a concrete leaf value + the envelope's provenance. */
-function leafFact(fieldPath: string, leafValue: unknown, ef: EnvelopeField<unknown>, ctx: ExtractCtx): Fact {
+/** Build one candidate at a leaf field_path with a concrete leaf value + the envelope's provenance. */
+function leafFact(fieldPath: string, leafValue: unknown, ef: EnvelopeField<unknown>, ctx: ExtractCtx): ExtractedFieldCandidate {
   const loc = locateEvidence(ctx.transcript, ef.evidence)
   return {
     id: factIdFor(ctx.customerId, fieldPath, ctx.sourceId), // deterministic -> idempotent reprocessing
@@ -31,9 +31,7 @@ function leafFact(fieldPath: string, leafValue: unknown, ef: EnvelopeField<unkno
     source_id: ctx.sourceId,
     source_date: ctx.sourceDate,
     extracted_at: ctx.clock.now(),
-    // All machine facts start needs_review; ambiguous/none is surfaced to reviewers via match_quality.
-    review_status: 'needs_review',
-    reviewed_value_json: null, reviewed_by: null, reviewed_at: null, superseded_by: null,
+    superseded_by: null,
   }
 }
 
@@ -59,7 +57,7 @@ const OBJECT_SHAPED_FIELDS = new Set(['mailing_address', 'premises_address'])
  * leaf key set to read off a null value, so the reconciler (Task 10) is the one that
  * materializes each bound leaf path (`mailing_address.street`, ...) as `missing` on its own.
  */
-function emitEnvelope(key: string, ef: EnvelopeField<unknown>, ctx: ExtractCtx, out: Fact[]): void {
+function emitEnvelope(key: string, ef: EnvelopeField<unknown>, ctx: ExtractCtx, out: ExtractedFieldCandidate[]): void {
   if (isPlainObject(ef.value)) {
     for (const [leaf, leafVal] of Object.entries(ef.value)) {
       out.push(leafFact(`${key}.${leaf}`, leafVal, ef, ctx))
@@ -72,8 +70,8 @@ function emitEnvelope(key: string, ef: EnvelopeField<unknown>, ctx: ExtractCtx, 
 }
 
 /** Flatten a validated envelope into candidate facts (scalars, nested-object leaves, collection items). */
-export function extractFacts(env: ExtractionEnvelope, ctx: ExtractCtx): Fact[] {
-  const facts: Fact[] = []
+export function extractFacts(env: ExtractionEnvelope, ctx: ExtractCtx): ExtractedFieldCandidate[] {
+  const facts: ExtractedFieldCandidate[] = []
   for (const [key, val] of Object.entries(env)) {
     if (val === undefined) continue
     if (Array.isArray(val)) {
