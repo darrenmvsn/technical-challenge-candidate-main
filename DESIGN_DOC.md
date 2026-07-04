@@ -33,6 +33,73 @@ raw transcript
 
 This replaces the simpler "one big customer/form JSON row" design.
 
+## How the System Works, End to End
+
+The pipeline runs in four stages. Each stage owns one durable step and hands off
+through the database, never through a shared in-memory call. The integration test
+(`tests/integration/pipeline.test.ts`) drives exactly this path.
+
+### 1. Ingest (webhook)
+
+A transcript arrives at `POST /webhook/transcript`. The payload is validated at the
+boundary, then stored as a `sources` row and a queued `processing_jobs` row — in one
+transaction. The webhook returns `202` immediately; it does no extraction. The
+transcript is now durable even though no customer is attached yet.
+
+### 2. Process (Processor)
+
+A worker claims the job under a fenced lease and runs one job to completion:
+
+1. **Extract.** The raw transcript goes to the LLM, which returns a schema-validated
+  envelope of field candidates (value, presence, confidence, evidence quote). This is
+   the only network call, and it happens *before* the database transaction.
+2. **Resolve identity.** The webhook payload has no `customer_id`. The processor reads
+  hard signals (FEIN, business email) from the extraction and either matches an
+   existing customer or creates one. Weak/ambiguous signals stop the source at
+   `needs_review` instead of guessing.
+3. **Persist — all or nothing.** Once identity is attached, one transaction writes the
+  evidence candidates, reconciles them against any prior reviewed value, projects the
+   current profile into a `form_drafts` row, and fences the job complete. If the
+   completion fence fails, none of it persists.
+
+After this stage the customer exists, evidence is stored, and a draft reflects the
+machine's best current value.
+
+### 3. Review + approve (ReviewClient)
+
+A human reviews the draft and calls `approveForm`. Approval never mutates evidence — it
+writes an immutable `field_review_versions` row (`approved` / `edited` /
+`accepted_conflict` / `approved_blank`). This is the record of human intent. Approving
+enqueues an `outbox` row carrying the exact fill payload and its content hash.
+
+### 4. Fill (OutboxWorker)
+
+The worker claims the pending outbox row under a lease and fills the PDF — an external
+side effect kept strictly outside any transaction. The blob is written to a
+content-addressed key `pdf/{customerId}/{formType}/{contentHash}`, and the draft is
+marked `filled`. Retries and crashes are safe: the same payload always fills to the same
+key, so re-running never duplicates a fill.
+
+### What happens on a correction
+
+A later transcript can disagree with an already-approved value. This is the case the
+design exists to handle safely:
+
+- The new evidence is stored as a **new candidate** — the first is never rewritten.
+- Because the current value was already approved, the reconciler does **not** overwrite
+it. It opens a `field_conflicts` row and waits. The re-projected draft still shows the
+approved value.
+- The already-filled PDF from the first approval is **immutable** — it is superseded, not
+mutated, and its blob bytes are untouched.
+- When the reviewer accepts the correction, that single human act writes an
+`accepted_conflict` review version, resolves the conflict, and enqueues a fresh fill.
+The new value fills to a *different* content-addressed key; the original fill still
+exists byte-for-byte.
+
+The end-to-end guarantee: every value on a filled form traces to either machine evidence
+or a human decision, a later disagreement always surfaces as a visible conflict rather
+than a silent overwrite, and every filled PDF stays reproducible.
+
 ## Database Shape
 
 ### `sources`
@@ -326,3 +393,4 @@ Raw sources can exist without customers.
 Customer-scoped data cannot exist until identity is resolved.
 Machine extraction is stored separately from human approval.
 ```
+
