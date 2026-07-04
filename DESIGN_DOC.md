@@ -393,4 +393,3 @@ Raw sources can exist without customers.
 Customer-scoped data cannot exist until identity is resolved.
 Machine extraction is stored separately from human approval.
 ```
-
