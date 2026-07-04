@@ -21,6 +21,17 @@ function inferStrength(type: IdentitySignalType): IdentitySignalStrength {
 export class CustomerIdentityRepo {
   constructor(private db: DB) {}
 
+  /**
+   * Run a group of writes atomically (AGENTS.md invariant #5). better-sqlite3 nests transactions
+   * via SAVEPOINTs, so this is safe to call from inside an outer transaction — e.g. the processor
+   * (Task 5) resolves identity inside its all-or-nothing persistence transaction (invariant #12).
+   * On a thrown error the inner savepoint rolls back to its start and the error re-propagates,
+   * leaving the outer transaction intact for the caller to handle.
+   */
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)()
+  }
+
   createCustomer(args: { legalName: string | null; dba: string | null; owner: string | null; now: string }): string {
     const id = newId()
     this.db.prepare('INSERT INTO customers (id, name, dba, owner) VALUES (?,?,?,?)')

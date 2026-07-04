@@ -47,10 +47,27 @@ export class CustomerResolver {
     // identifier appears to belong to an existing customer by exact name/address. They never
     // auto-resolve a source by themselves.
 
-    const insertSignalsOrNeedsReview = (customerId: string): CustomerResolution | undefined => {
+    // Attach signals + record the 'resolved' verdict as ONE atomic unit (invariant #5): the
+    // customer creation (when `create` is provided), every signal insert, and the resolution row
+    // commit or roll back together, so a mid-write failure never leaves an orphaned customer or a
+    // half-written identity. A hard-signal conflict (only reachable under a concurrent TOCTOU race,
+    // since matches are pre-checked above) rolls the whole unit back, then records needs_review.
+    const commitResolved = (
+      existingCustomerId: string | null,
+      create: (() => string) | null,
+      resolvedReason: string,
+    ): CustomerResolution => {
       try {
-        for (const signal of signals) this.repo.insertSignal(customerId, signal, ctx.sourceId, ctx.now)
-        return undefined
+        const customerId = this.repo.transaction(() => {
+          const id = create ? create() : existingCustomerId!
+          for (const signal of signals) this.repo.insertSignal(id, signal, ctx.sourceId, ctx.now)
+          this.repo.insertResolution({
+            sourceId: ctx.sourceId, status: 'resolved', customerId: id,
+            reason: resolvedReason, matchedSignalsJson, now: ctx.now,
+          })
+          return id
+        })
+        return { status: 'resolved', customerId, reason: resolvedReason }
       } catch (e) {
         if (!(e instanceof IdentitySignalConflictError)) throw e
         this.repo.insertResolution({
@@ -70,14 +87,7 @@ export class CustomerResolver {
     }
 
     if (hardMatchedCustomerIds.length === 1) {
-      const customerId = hardMatchedCustomerIds[0]!
-      const conflict = insertSignalsOrNeedsReview(customerId)
-      if (conflict) return conflict
-      this.repo.insertResolution({
-        sourceId: ctx.sourceId, status: 'resolved', customerId,
-        reason: 'matched_hard_identity_signal', matchedSignalsJson, now: ctx.now,
-      })
-      return { status: 'resolved', customerId, reason: 'matched_hard_identity_signal' }
+      return commitResolved(hardMatchedCustomerIds[0]!, null, 'matched_hard_identity_signal')
     }
 
     if (supportingMatchedCustomerIds.length === 1) {
@@ -94,18 +104,20 @@ export class CustomerResolver {
     const dba = env.dba_name?.presence === 'present' && typeof env.dba_name.value === 'string'
       ? env.dba_name.value
       : null
+    // Only take a name part when the field is actually present — a needs_follow_up/not_applicable
+    // field can still carry a non-null value, and that must not silently populate a new customer's
+    // owner (this data is persisted, not just a test fixture).
+    const ownerPart = (f: { value: string | null; presence: string } | undefined): string | null =>
+      f?.presence === 'present' && typeof f.value === 'string' && f.value.length > 0 ? f.value : null
     const owner = [
-      env.policyholder_first_name?.value,
-      env.policyholder_last_name?.value,
-    ].filter(v => typeof v === 'string' && v.length > 0).join(' ') || null
+      ownerPart(env.policyholder_first_name),
+      ownerPart(env.policyholder_last_name),
+    ].filter((v): v is string => v !== null).join(' ') || null
 
-    const customerId = this.repo.createCustomer({ legalName, dba, owner, now: ctx.now })
-    const conflict = insertSignalsOrNeedsReview(customerId)
-    if (conflict) return conflict
-    this.repo.insertResolution({
-      sourceId: ctx.sourceId, status: 'resolved', customerId,
-      reason: 'created_from_hard_identity_signal', matchedSignalsJson, now: ctx.now,
-    })
-    return { status: 'resolved', customerId, reason: 'created_from_hard_identity_signal' }
+    return commitResolved(
+      null,
+      () => this.repo.createCustomer({ legalName, dba, owner, now: ctx.now }),
+      'created_from_hard_identity_signal',
+    )
   }
 }
