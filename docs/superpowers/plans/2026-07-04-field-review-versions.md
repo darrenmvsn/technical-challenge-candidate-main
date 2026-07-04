@@ -26,6 +26,14 @@ inserted.
 
 This is a greenfield branch refactor. Do not build a backwards-compatible production data migration from `facts`; replace the schema and code before landing the branch.
 
+### Atomic rename boundary
+
+Task 1 and Task 2 are an atomic merge pair. Task 1 changes the persisted table/type names, and
+Task 2 updates the repo/selector imports that make the branch compile against those names. Do not
+land Task 1 by itself unless it intentionally keeps temporary compatibility aliases for `Fact`,
+`FactsRepo`, and `facts`. The recommended delivery is one PR containing both Task 1 and Task 2
+commits, with typecheck run after Task 2.
+
 In this plan:
 
 - Rename `facts` table to `extracted_field_candidates`.
@@ -150,7 +158,14 @@ CREATE TABLE IF NOT EXISTS field_conflicts (
 );
 CREATE INDEX IF NOT EXISTS idx_field_conflicts_customer_status
   ON field_conflicts(customer_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_field_conflicts_open_unique
+  ON field_conflicts(customer_id, conflicting_candidate_id)
+  WHERE status = 'unresolved';
 ```
+
+The partial unique index makes conflict insertion idempotent under retries and lease races: the same
+candidate can have only one unresolved conflict for a customer. A resolved conflict remains in the
+audit trail, and a later genuinely new conflicting candidate can still open a new unresolved row.
 
 Remove these columns from the old candidate row shape:
 
@@ -211,6 +226,21 @@ it('field_review_versions enforces per-field monotonically unique versions', () 
     (id, customer_id, field_path, version, candidate_id, value_json, presence, action, reviewed_by, reviewed_at)
     VALUES ('rv2', 'c1', 'annual_gross_revenue', 1, 'cand1', '2500000', 'present', 'approved', 'sarah', '2025-01-02T00:00:00Z')`).run()).toThrow()
 })
+
+it('field_conflicts allows only one unresolved conflict per conflicting candidate', () => {
+  const db = openDb()
+  migrate(db)
+  db.prepare(`INSERT INTO field_conflicts
+    (id, customer_id, field_path, current_candidate_id, conflicting_candidate_id, status, created_at)
+    VALUES ('conf1', 'c1', 'annual_gross_revenue', 'old', 'new', 'unresolved', '2025-01-02T00:00:00Z')`).run()
+  expect(() => db.prepare(`INSERT INTO field_conflicts
+    (id, customer_id, field_path, current_candidate_id, conflicting_candidate_id, status, created_at)
+    VALUES ('conf2', 'c1', 'annual_gross_revenue', 'old', 'new', 'unresolved', '2025-01-02T00:00:00Z')`).run()).toThrow()
+  db.prepare(`UPDATE field_conflicts SET status='resolved' WHERE id='conf1'`).run()
+  expect(() => db.prepare(`INSERT INTO field_conflicts
+    (id, customer_id, field_path, current_candidate_id, conflicting_candidate_id, status, created_at)
+    VALUES ('conf3', 'c1', 'annual_gross_revenue', 'old', 'new', 'unresolved', '2025-01-03T00:00:00Z')`).run()).not.toThrow()
+})
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -262,7 +292,10 @@ export interface FieldReviewVersion {
 
 export interface CurrentFieldValue {
   field_path: string
-  candidate: ExtractedFieldCandidate
+  /** The machine-selected candidate by source_date > confidence > extracted_at. */
+  selected_candidate: ExtractedFieldCandidate
+  /** The candidate whose evidence supports value_json; equals selected_candidate when no review exists. */
+  value_candidate: ExtractedFieldCandidate
   review: FieldReviewVersion | null
   value_json: string | null
   presence: Presence
@@ -296,6 +329,9 @@ npx vitest run tests/db/migrations.test.ts tests/schema/profile.test.ts
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
+
+If Task 1 did not keep temporary compatibility aliases, do not land this commit by itself. Create
+this as the first commit in the combined Task 1 + Task 2 PR, then run typecheck after Task 2.
 
 ```bash
 git add src/schema/profile.ts src/db/migrations.ts tests/db/migrations.test.ts tests/schema/profile.test.ts
@@ -440,6 +476,9 @@ Expected: PASS after import updates.
 
 - [ ] **Step 7: Commit**
 
+This completes the atomic rename pair started in Task 1. Land Task 1 + Task 2 together unless Task
+1 explicitly kept compatibility aliases.
+
 ```bash
 git add src/db/repos/extractedFieldCandidates.ts src/profile/candidateSelector.ts src/extraction src/profile tests
 git rm src/db/repos/facts.ts src/profile/factSelector.ts tests/profile/factSelector.test.ts
@@ -525,6 +564,39 @@ describe('FieldReviewVersionsRepo', () => {
     reviews.insertVersion({ customerId: 'c1', fieldPath: 'annual_gross_revenue', candidateId: 'cand2', valueJson: '2800000', presence: 'present', action: 'edited', reviewedBy: 'sarah', reviewedAt: '2025-03-17T00:00:00Z' })
     expect(reviews.latestMap('c1').get('annual_gross_revenue')!.value_json).toBe('2800000')
   })
+
+  it('rejects a review version whose candidate does not belong to the same customer and field', () => {
+    expect(() => reviews.insertVersion({
+      customerId: 'c1',
+      fieldPath: 'annual_gross_revenue',
+      candidateId: 'missing-candidate',
+      valueJson: '2500000',
+      presence: 'present',
+      action: 'approved',
+      reviewedBy: 'sarah',
+      reviewedAt: '2025-03-16T00:00:00Z',
+    })).toThrow(/candidate/)
+    expect(() => reviews.insertVersion({
+      customerId: 'c2',
+      fieldPath: 'annual_gross_revenue',
+      candidateId: 'cand1',
+      valueJson: '2500000',
+      presence: 'present',
+      action: 'approved',
+      reviewedBy: 'sarah',
+      reviewedAt: '2025-03-16T00:00:00Z',
+    })).toThrow(/candidate/)
+    expect(() => reviews.insertVersion({
+      customerId: 'c1',
+      fieldPath: 'employee_count_full_time',
+      candidateId: 'cand1',
+      valueJson: '2500000',
+      presence: 'present',
+      action: 'approved',
+      reviewedBy: 'sarah',
+      reviewedAt: '2025-03-16T00:00:00Z',
+    })).toThrow(/candidate/)
+  })
 })
 ```
 
@@ -558,6 +630,7 @@ export class FieldReviewVersionsRepo {
   constructor(private db: DB) {}
 
   insertVersion(args: InsertReviewVersion): FieldReviewVersion {
+    this.assertCandidateMatches(args.customerId, args.fieldPath, args.candidateId)
     const next = this.nextVersion(args.customerId, args.fieldPath)
     const id = newId()
     this.db.prepare(`INSERT INTO field_review_versions
@@ -591,6 +664,16 @@ export class FieldReviewVersionsRepo {
       FROM field_review_versions WHERE customer_id=? AND field_path=?`)
       .get(customerId, fieldPath) as { n: number }
     return row.n
+  }
+
+  private assertCandidateMatches(customerId: string, fieldPath: string, candidateId: string): void {
+    const row = this.db.prepare(`SELECT customer_id, field_path
+      FROM extracted_field_candidates WHERE id=?`).get(candidateId) as
+      | { customer_id: string; field_path: string }
+      | undefined
+    if (!row || row.customer_id !== customerId || row.field_path !== fieldPath) {
+      throw new Error(`review candidate ${candidateId} does not belong to ${customerId}/${fieldPath}`)
+    }
   }
 }
 ```
@@ -671,7 +754,8 @@ describe('currentProfileMap', () => {
     expect(current.value_json).toBe('2500000')
     expect(current.review_status).toBe('approved')
     expect(current.review!.candidate_id).toBe('cand-old')
-    expect(current.candidate.id).toBe('cand-new')
+    expect(current.selected_candidate.id).toBe('cand-new')
+    expect(current.value_candidate.id).toBe('cand-old')
   })
 
   it('falls back to the selected machine candidate when no review exists', () => {
@@ -682,6 +766,8 @@ describe('currentProfileMap', () => {
     const current = currentProfileMap(candidates, reviews, 'c1').get('annual_gross_revenue')!
     expect(current.value_json).toBe('2800000')
     expect(current.review_status).toBe('needs_review')
+    expect(current.selected_candidate.id).toBe('cand-new')
+    expect(current.value_candidate.id).toBe('cand-new')
   })
 })
 ```
@@ -710,13 +796,16 @@ export function currentProfileMap(
   const reviewMap = reviews.latestMap(customerId)
   const out = new Map<string, CurrentFieldValue>()
 
-  for (const [fieldPath, candidate] of candidateMap) {
+  for (const [fieldPath, selectedCandidate] of candidateMap) {
     const review = reviewMap.get(fieldPath) ?? null
-    const value_json = review ? review.value_json : candidate.value_json
-    const presence = review ? review.presence : candidate.presence
+    const valueCandidate = review ? candidates.get(review.candidate_id) : selectedCandidate
+    if (!valueCandidate) throw new Error(`missing candidate for review ${review!.id}`)
+    const value_json = review ? review.value_json : selectedCandidate.value_json
+    const presence = review ? review.presence : selectedCandidate.presence
     out.set(fieldPath, {
       field_path: fieldPath,
-      candidate,
+      selected_candidate: selectedCandidate,
+      value_candidate: valueCandidate,
       review,
       value_json,
       presence,
@@ -818,6 +907,30 @@ it('does not open a conflict when no human review version exists', () => {
 })
 ```
 
+Add an idempotency test:
+
+```ts
+it('does not duplicate an unresolved conflict when reconcile runs twice for the same candidate', () => {
+  candidates.insertMany([
+    candidate({ id: 'old', value_json: '2500000', source_date: '2025-03-12T00:00:00Z' }),
+    candidate({ id: 'new', value_json: '2800000', source_date: '2025-03-15T00:00:00Z' }),
+  ])
+  reviews.insertVersion({
+    customerId: 'c1',
+    fieldPath: 'annual_gross_revenue',
+    candidateId: 'old',
+    valueJson: '2500000',
+    presence: 'present',
+    action: 'approved',
+    reviewedBy: 'sarah',
+    reviewedAt: '2025-03-16T00:00:00Z',
+  })
+  reconcile({ db, candidates, reviews, conflicts, clock, customerId: 'c1', formTypes: ['acord_125'] })
+  reconcile({ db, candidates, reviews, conflicts, clock, customerId: 'c1', formTypes: ['acord_125'] })
+  expect(conflicts.listUnresolved('c1')).toHaveLength(1)
+})
+```
+
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
@@ -846,7 +959,7 @@ export interface FieldConflictRow {
 
 export class FieldConflictsRepo {
   existsOpen(customerId: string, conflictingCandidateId: string): boolean
-  insert(customerId: string, fieldPath: string, currentCandidateId: string, conflictingCandidateId: string, now: string): void
+  insert(customerId: string, fieldPath: string, currentCandidateId: string, conflictingCandidateId: string, now: string): void // idempotent with INSERT OR IGNORE against idx_field_conflicts_open_unique
   listUnresolved(customerId: string): FieldConflictRow[]
   get(id: string): FieldConflictRow | undefined
   resolve(id: string, reviewVersionId: string, by: string, at: string): void
@@ -862,6 +975,7 @@ for each fieldPath:
   const latestReview = reviews.latestByField(customerId, fieldPath)
   if no latestReview: continue
   const reviewedCandidate = candidates.get(latestReview.candidate_id)
+  if reviewedCandidate is missing: throw
   const selectedMachine = selectCurrentCandidate(candidates.byField(customerId, fieldPath))
   if selectedMachine is missing: continue
   if selectedMachine.id === latestReview.candidate_id: continue
@@ -967,11 +1081,12 @@ Rules:
      - `valueJson = JSON.stringify(editValue)`
    - Resolve that conflict with the new review version id.
    - Otherwise insert a version with:
-     - `candidateId = currentField.candidate.id`
+     - `candidateId = currentField.value_candidate.id`
      - `action = 'edited'`
 4. For each form-bound field not explicitly edited:
    - Insert a review version with `action = currentField.presence === 'present' ? 'approved' : 'approved_blank'`.
    - `valueJson = currentField.value_json`.
+   - `candidateId = currentField.value_candidate.id`.
 5. Recompute current profile after inserting versions.
 6. Render form from the recomputed profile.
 7. Preserve existing draft/outbox supersession behavior.
@@ -992,9 +1107,9 @@ Use `CurrentFieldValue`:
 
 ```ts
 provenance: field ? {
-  quote: field.candidate.evidence_quote,
-  span: field.candidate.evidence_span_start !== null ? [field.candidate.evidence_span_start, field.candidate.evidence_span_end] : null,
-  confidence: field.candidate.confidence,
+  quote: field.value_candidate.evidence_quote,
+  span: field.value_candidate.evidence_span_start !== null ? [field.value_candidate.evidence_span_start, field.value_candidate.evidence_span_end] : null,
+  confidence: field.value_candidate.confidence,
   presence: field.presence,
   review_status: field.review_status,
   approved_blank: field.approved_blank,
@@ -1022,6 +1137,10 @@ new ReviewClient({
 Update `Processor` deps to include `reviewVersions` so it can call `currentProfileMap` before rendering drafts.
 
 - [ ] **Step 7: Run review and integration tests**
+
+Keep the existing review-client behavior tests when porting this file: shared-field ripple,
+re-approving a filled form, pending outbox cancellation, `approved_blank`, and flat/nested payload
+separation are still required behaviors.
 
 ```bash
 npx vitest run tests/review/reviewClient.test.ts tests/integration/pipeline.test.ts tests/worker/processor.test.ts
@@ -1065,9 +1184,10 @@ Replace "Fact selection only via `selectCurrentFact`" with:
 7. **Current profile is computed, not copied.** Machine/source evidence lives in
    `extracted_field_candidates`; human decisions live in immutable
    `field_review_versions`. Candidate selection is pure
-   `selectCurrentCandidate` (source_date > confidence > extracted_at). Current reviewed
-   values are computed by overlaying the latest review version on the selected candidate.
-   Do not copy active reviewed values into candidate rows.
+   `selectCurrentCandidate` (source_date > confidence > extracted_at). Current values keep
+   two explicit pointers: `selected_candidate` for newest machine evidence and
+   `value_candidate` for the evidence behind the displayed value. Do not copy active
+   reviewed values into candidate rows.
 ```
 
 Update table naming references:
@@ -1090,8 +1210,10 @@ The implementation uses clearer table names than the original shorthand:
 - `conflicts` became `field_conflicts`.
 - Human approval state moved out of candidate rows into immutable `field_review_versions`.
 
-Current canonical values are computed by joining selected candidates with the latest field
-review version. Form drafts and outbox payloads remain immutable snapshots.
+Current canonical values are computed from selected candidates plus the latest field review
+version. Reads keep `selected_candidate` separate from `value_candidate` so provenance always
+points at the evidence behind the displayed value. Form drafts and outbox payloads remain
+immutable snapshots.
 ```
 
 - [ ] **Step 4: Run stale-name scan again**
