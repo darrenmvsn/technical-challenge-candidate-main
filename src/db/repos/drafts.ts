@@ -30,18 +30,18 @@ export class DraftsRepo {
   }
 
   /**
-   * Reproject the current draft from fresh facts.
+   * Reproject the current draft from fresh candidates.
    *  - no current row → create revision 1.
    *  - current is 'filled' → a filled draft is IMMUTABLE (its PDF may be at a carrier), so we
    *    mint a new needs_review revision and mark the old row superseded. Routed through
    *    newRevision() so `superseded_by_revision` is always set — never a dangling filled row
    *    with `superseded_by_revision IS NULL` (which would break the single-current invariant).
    *  - current is needs_review/approved (not yet filled), projection UNCHANGED → no-op: return the
-   *    row untouched. A reprocess that yields byte-identical facts must NOT reset an approved draft
+   *    row untouched. A reprocess that yields byte-identical candidates must NOT reset an approved draft
    *    to needs_review, bump updated_at, or disturb an in-flight fill for that same content — doing
    *    so would withhold an otherwise-valid, already-approved fill until a re-approval that merely
    *    re-confirms identical data. Byte comparison is sound: `projected_json` was written via
-   *    `JSON.stringify(mapping)` and renderForm projects the same facts to the same key order, so
+   *    `JSON.stringify(mapping)` and renderForm projects the same candidates to the same key order, so
    *    identical content serializes identically.
    *  - current is needs_review/approved (not yet filled), projection CHANGED → overwrite its
    *    projection in place and reset to needs_review; new data invalidates any prior approval, so

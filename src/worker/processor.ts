@@ -35,11 +35,11 @@ const BACKOFF_MS = [5_000, 30_000, 120_000, 600_000]
  * Ordering per job (AGENTS.md #12): claim (fenced, via `LeaseClaimer` on `processing_jobs`) ->
  * `llm.extract` OUTSIDE any transaction (the only async/network work in this worker) -> ONE
  * transaction that atomically {stores the extraction, resolves the customer identity, registers
- * collection items, inserts facts, reconciles/detects conflicts, re-projects every form draft +
+ * collection items, inserts candidates, reconciles/detects conflicts, re-projects every form draft +
  * its bindings, and fence-completes the job}. Identity resolution (`CustomerResolver.resolve`)
  * runs INSIDE this transaction — it performs its own DB writes (customer + identity signals +
  * resolution row), and better-sqlite3 nests them via SAVEPOINTs, so they are atomic with the
- * fact/draft writes: a customer is never created without its facts, and vice versa. If the
+ * candidate/draft writes: a customer is never created without its candidates, and vice versa. If the
  * fenced `complete()` returns false (lease lost to another worker), we throw to roll the WHOLE
  * transaction back — nothing above it persists — and the row is left processing until its lease
  * expires and it is reclaimed and redone cleanly.
@@ -47,7 +47,7 @@ const BACKOFF_MS = [5_000, 30_000, 120_000, 600_000]
  * Identity is resolved from the transcript, not carried on the job: a source ingested BEFORE its
  * customer is known (`customer_id` null) is resolved here. An ambiguous/absent hard identity
  * signal parks the source at `identity_needs_review` and completes the job WITHOUT writing any
- * customer-scoped facts. A source whose `customer_id` was already set (the manual identity-review
+ * customer-scoped candidates. A source whose `customer_id` was already set (the manual identity-review
  * attach path, Task 6) skips the automatic resolver and persists under the reviewer's choice. A
  * stored `extraction_json` is reused (re-validated, no second LLM call) so a requeue after review
  * — or any retry — is cheap and side-effect-free.
@@ -58,10 +58,10 @@ const BACKOFF_MS = [5_000, 30_000, 120_000, 600_000]
  * persist transaction. `extractFacts` is synchronous, but for repeated-collection fields (e.g.
  * `claims`) it calls `resolveItemId`, which — on a natural key not yet seen — performs a real
  * SQLite write via `CollectionItemsRepo.insert` (AGENTS.md #12 explicitly lists "collection item
- * registry writes" as one of the things that must commit atomically with facts/reconciliation/
+ * registry writes" as one of the things that must commit atomically with candidates/reconciliation/
  * projection/fenced-completion). Running `extractFacts` outside the transaction meant that write
  * auto-committed immediately, independent of whether the fence later succeeded — so a lost lease
- * would roll back facts/drafts/job-completion but leave a NEW collection_items row behind,
+ * would roll back candidates/drafts/job-completion but leave a NEW collection_items row behind,
  * silently violating the all-or-nothing invariant. The fix keeps `extractFacts` inside
  * `persistAndComplete`, after the LLM call: the ONLY thing left outside the transaction is the
  * `await this.d.llm.extract(...)` call itself. Also fixed inline `new Date(...)` backoff math to
@@ -113,11 +113,11 @@ export class Processor {
 
           // extractFacts registers new collection items (a DB write via resolveItemId) — must run
           // INSIDE this transaction so it rolls back with everything else if the fence fails.
-          const facts = extractFacts(env, {
+          const candidates = extractFacts(env, {
             customerId, sourceId: source.id, sourceDate: source.source_date,
             transcript, clock: this.d.clock, itemsRepo: this.d.items,
           })
-          this.d.candidates.insertMany(facts)
+          this.d.candidates.insertMany(candidates)
           reconcile({
             db: this.d.db, candidates: this.d.candidates, reviews: this.d.reviewVersions, conflicts: this.d.conflicts,
             clock: this.d.clock, customerId, formTypes: this.d.formTypes,

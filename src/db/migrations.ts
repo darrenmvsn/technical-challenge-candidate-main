@@ -31,7 +31,7 @@
  * resolved (the processor resolves it later), so it has no customer at insert time.
  *
  * Queue/current-read hot paths get supporting indexes: job/outbox claim queries filter on
- * (status, next_attempt_at); the "current fact"/"current draft" reads filter on
+ * (status, next_attempt_at); the "current candidate"/"current draft" reads filter on
  * (customer_id, field_path/form_type, superseded_by/superseded_by_revision); conflict
  * listing filters on (customer_id, status); source dedup checks by checksum. The checksum
  * index is UNIQUE because checksum is the durable content-identity dedupe key.

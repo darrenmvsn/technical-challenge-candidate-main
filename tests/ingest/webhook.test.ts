@@ -85,7 +85,7 @@ describe('POST /webhook/transcript', () => {
 
   it('rejects a non-ISO date with 4xx and creates NO rows (AGENTS.md #3/#10)', async () => {
     // A malformed source_date would sort lexicographically above real ISO dates and permanently
-    // hijack selectCurrentFact — reject it at the boundary before it is ever persisted.
+    // hijack selectCurrentCandidate — reject it at the boundary before it is ever persisted.
     const res = await app.inject({
       method: 'POST', url: '/webhook/transcript',
       payload: { ...body, date: 'zzzz' },

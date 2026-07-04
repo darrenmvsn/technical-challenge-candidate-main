@@ -53,8 +53,13 @@ Source of truth for detail:
 6. **Explicit presence.** Every fact carries `presence ∈ {present, missing, needs_follow_up,
    not_applicable}`. `evidence` is `null` **only** for `missing`. No bare ambiguous nulls.
 
-7. **Fact selection only via `selectCurrentFact`.** Order is approval > source_date >
-   confidence > extracted_at (`src/profile/factSelector.ts`). **Never** `ORDER BY id`.
+7. **Current profile is computed, not copied.** Machine/source evidence lives in
+   `extracted_field_candidates`; human decisions live in immutable
+   `field_review_versions`. Candidate selection is pure
+   `selectCurrentCandidate` (source_date > confidence > extracted_at). Current values keep
+   two explicit pointers: `selected_candidate` for newest machine evidence and
+   `value_candidate` for the evidence behind the displayed value. Do not copy active
+   reviewed values into candidate rows.
 
 8. **Lease writes are fenced.** Claims use `BEGIN IMMEDIATE` plus a guarded update that
    re-checks claimability (`status='pending'` or expired processing lease, due
@@ -71,11 +76,11 @@ Source of truth for detail:
 
 10. **API boundaries validate before use.** Ingress payloads are validated with Zod or a
     Fastify schema before any DB write. No raw `req.body as ...` trust boundary casts in
-    route handlers. Bad payloads return 4xx without creating sources, jobs, facts, drafts,
-    or outbox rows.
+    route handlers. Bad payloads return 4xx without creating sources, jobs, extracted field
+    candidates, drafts, or outbox rows.
 
 11. **DB invariants are encoded in SQLite where cheap.** Finite states (`presence`,
-    `review_status`, job/outbox statuses, conflict status, form type) get `CHECK`
+    `action`, job/outbox statuses, conflict status, form type) get `CHECK`
     constraints where practical, and queue/current-read paths get supporting indexes. Do
     not rely only on TypeScript types for persisted data integrity.
 
@@ -86,8 +91,8 @@ Source of truth for detail:
     processor is the LLM call before that transaction.
 
 13. **Raw transcript identity resolution.** The webhook payload does not contain `customer_id`.
-    Raw `sources` may be customerless, but customer-scoped tables (`facts` /
-    `extracted_field_candidates`, `collection_items`, `form_drafts`, `outbox`, conflicts) must
+    Raw `sources` may be customerless, but customer-scoped tables (`extracted_field_candidates`,
+    `collection_items`, `form_drafts`, `outbox`, `field_conflicts`, `field_review_versions`) must
     never receive rows until identity resolution has attached a stable `customer_id`. Identity
     auto-resolution is exact-hard-signal-only (`fein`, `email`); supporting signals (`phone`,
     `business_name_state`, `mailing_address`) never merge or create a customer by themselves,
@@ -140,9 +145,10 @@ Commands: `npm test` (vitest run) · `npm run typecheck` (tsc --noEmit) · `npm 
   but absent from a form's bindings is extracted and stored but never projected — that is
   **intentional, not a bug**.
 - **`markNotApplicable` (present → not_applicable flip) is deferred — out of scope, not a
-  bug.** `markApproved` sets `review_status` + `reviewed_value_json` only; it does not mutate
-  `presence`. Approving an already-`missing`/`needs_follow_up` field with a null value
-  (`approved_blank`) **is** in scope and tested.
+  bug.** `approveForm` records an immutable `field_review_versions` row (`approved`/
+  `approved_blank`); it never mutates candidate `presence`. Reviewer-initiated
+  present→not_applicable is a deferred extension. Approving an already-`missing`/
+  `needs_follow_up` field with a null value (`approved_blank`) **is** in scope and tested.
 
 Extending coverage is mechanical (add rows to `STATIC_BINDINGS`/`COLLECTION_BINDINGS`, add
 fields to `ExtractionEnvelope`) and needs no architecture changes — but it is **not this

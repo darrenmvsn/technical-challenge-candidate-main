@@ -50,8 +50,8 @@ const isPlainObject = (v: unknown): v is Record<string, unknown> =>
 const OBJECT_SHAPED_FIELDS = new Set(['mailing_address', 'premises_address'])
 
 /**
- * Emit facts for one envelope field. A scalar value -> one fact at `key`. A fixed nested
- * object value (e.g. mailing_address {street,city,...}) -> one LEAF fact per key
+ * Emit candidates for one envelope field. A scalar value -> one candidate at `key`. A fixed nested
+ * object value (e.g. mailing_address {street,city,...}) -> one LEAF candidate per key
  * (`mailing_address.street`, ...) so paths line up with the form bindings. An object-shaped
  * field that is `missing`/`needs_follow_up` (value null) emits NOTHING here — there is no
  * leaf key set to read off a null value, so the reconciler (Task 10) is the one that
@@ -69,9 +69,9 @@ function emitEnvelope(key: string, ef: EnvelopeField<unknown>, ctx: ExtractCtx, 
   }
 }
 
-/** Flatten a validated envelope into candidate facts (scalars, nested-object leaves, collection items). */
+/** Flatten a validated envelope into candidate rows (scalars, nested-object leaves, collection items). */
 export function extractFacts(env: ExtractionEnvelope, ctx: ExtractCtx): ExtractedFieldCandidate[] {
-  const facts: ExtractedFieldCandidate[] = []
+  const candidates: ExtractedFieldCandidate[] = []
   for (const [key, val] of Object.entries(env)) {
     if (val === undefined) continue
     if (Array.isArray(val)) {
@@ -79,12 +79,12 @@ export function extractFacts(env: ExtractionEnvelope, ctx: ExtractCtx): Extracte
         const itemId = resolveItemId(ctx.itemsRepo, ctx.clock, ctx.customerId, key, item.natural_key)
         for (const [field, ef] of Object.entries(item)) {
           if (field === 'natural_key' || !isEnvelope(ef)) continue
-          emitEnvelope(`${key}.${itemId}.${field}`, ef, ctx, facts)
+          emitEnvelope(`${key}.${itemId}.${field}`, ef, ctx, candidates)
         }
       }
     } else if (isEnvelope(val)) {
-      emitEnvelope(key, val, ctx, facts)
+      emitEnvelope(key, val, ctx, candidates)
     }
   }
-  return facts
+  return candidates
 }

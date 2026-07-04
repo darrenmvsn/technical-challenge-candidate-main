@@ -8,31 +8,31 @@ const val = (f: CurrentFieldValue | undefined): string | number | boolean | null
 }
 
 /** Distinct item_ids present for a collection, sorted for deterministic positional order. */
-function itemIdsFor(collection: string, facts: Map<string, CurrentFieldValue>): string[] {
+function itemIdsFor(collection: string, fields: Map<string, CurrentFieldValue>): string[] {
   const ids = new Set<string>()
-  for (const path of facts.keys()) {
+  for (const path of fields.keys()) {
     const m = path.match(new RegExp(`^${collection}\\.([^.]+)\\.`))
     if (m) ids.add(m[1]!)
   }
   return [...ids].sort()
 }
 
-export function renderForm(formType: FormType, facts: Map<string, CurrentFieldValue>): RenderResult {
+export function renderForm(formType: FormType, fields: Map<string, CurrentFieldValue>): RenderResult {
   const mapping: FormMapping = {}
   const fieldBindings: FieldBinding[] = []
 
   for (const b of STATIC_BINDINGS[formType]) {
-    mapping[b.form_field_path] = val(facts.get(b.profile_field_path))
+    mapping[b.form_field_path] = val(fields.get(b.profile_field_path))
     fieldBindings.push({ form_field_path: b.form_field_path, profile_field_path: b.profile_field_path })
   }
 
   for (const coll of COLLECTION_BINDINGS[formType]) {
-    const ids = itemIdsFor(coll.collection, facts)
+    const ids = itemIdsFor(coll.collection, fields)
     ids.forEach((itemId, i) => {
       for (const field of coll.fields) {
         const formPath = `${coll.form_prefix}[${i}].${field}`
         const profilePath = `${coll.collection}.${itemId}.${field}`
-        mapping[formPath] = val(facts.get(profilePath))
+        mapping[formPath] = val(fields.get(profilePath))
         fieldBindings.push({ form_field_path: formPath, profile_field_path: profilePath })
       }
     })

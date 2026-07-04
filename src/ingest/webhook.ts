@@ -15,8 +15,8 @@ export interface WebhookDeps { db: DB; clock: Clock; wake: () => void }
  *
  * The payload is now the RAW transcript object (no `customer_id` — identity is resolved later,
  * by the processor, from the transcript content). `date` is still validated as a real ISO-8601
- * UTC timestamp: it is persisted as `source_date` and drives lexicographic fact selection
- * (selectCurrentFact), so a malformed value ("zzzz") must never reach the DB and sort above real
+ * UTC timestamp: it is persisted as `source_date` and drives lexicographic candidate selection
+ * (selectCurrentCandidate), so a malformed value ("zzzz") must never reach the DB and sort above real
  * dates. `participants` is captured verbatim in `raw_json` for provenance.
  */
 const RawTranscript = z.object({

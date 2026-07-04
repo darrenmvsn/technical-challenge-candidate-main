@@ -8,6 +8,19 @@
 
 **Tech Stack:** TypeScript (ESM), Node 20+, Fastify, Zod, better-sqlite3, Vercel AI SDK v6 (`generateText` + `Output.object`, behind `LlmClient`), Vitest.
 
+### Amendment: Review-Version Model
+
+The implementation uses clearer table names than the original shorthand:
+
+- `facts` became `extracted_field_candidates`.
+- `conflicts` became `field_conflicts`.
+- Human approval state moved out of candidate rows into immutable `field_review_versions`.
+
+Current canonical values are computed from selected candidates plus the latest field review
+version. Reads keep `selected_candidate` separate from `value_candidate` so provenance always
+points at the evidence behind the displayed value. Form drafts and outbox payloads remain
+immutable snapshots.
+
 ## Global Constraints
 
 - **Language:** TypeScript, ESM (`"type": "module"`), `strict: true`. Node ≥ 20.

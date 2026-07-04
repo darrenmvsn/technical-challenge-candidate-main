@@ -180,7 +180,7 @@ describe('Processor.drainOnce', () => {
 
     // A correcting transcript (revenue 2.8M, a NEWER source) is processed BEFORE the fill drains.
     // It carries the SAME FEIN, so it resolves to the SAME customer. These revenue facts were never
-    // approved, so the newer value wins selectCurrentFact and the projection changes; upsertProjection
+    // approved, so the newer value wins selectCurrentCandidate and the projection changes; upsertProjection
     // rewrites the approved draft IN PLACE (same revision, reset to needs_review). The processor must
     // cancel the now-stale pending fill.
     const s2 = newId(), j2 = newId()
