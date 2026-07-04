@@ -4,8 +4,8 @@ import { buildWebhookApp } from '../../src/ingest/webhook.js'
 import { FixedClock } from '../../src/clock.js'
 
 const body = {
-  customer_id: 'c1',
-  source: { id: 'src_001', type: 'call_transcript', date: '2025-03-12T10:30:00Z', content: 'hello' },
+  id: 'src_001', type: 'call_transcript', date: '2025-03-12T10:30:00Z',
+  participants: ['Sarah Chen (Agent)', 'Mike Torres'], content: 'hello',
 }
 
 function countRows(db: DB, table: 'sources' | 'processing_jobs'): number {
@@ -20,12 +20,14 @@ describe('POST /webhook/transcript', () => {
     app = buildWebhookApp({ db, clock: new FixedClock('2025-03-12T10:31:00Z'), wake: () => { woke++ } })
   })
 
-  it('persists source + job and returns 202', async () => {
+  it('persists source + job (customer_id null) and returns 202', async () => {
     const res = await app.inject({ method: 'POST', url: '/webhook/transcript', payload: body })
     expect(res.statusCode).toBe(202)
     expect(JSON.parse(res.body).job_id).toBeTruthy()
     expect(countRows(db, 'sources')).toBe(1)
     expect(countRows(db, 'processing_jobs')).toBe(1)
+    // Identity is unresolved at ingest: the source is stored customer-agnostic.
+    expect((db.prepare('SELECT customer_id FROM sources WHERE id=?').get(body.id) as { customer_id: string | null }).customer_id).toBeNull()
     expect(woke).toBe(1) // processor nudged exactly once for a real ingest
   })
 
@@ -39,11 +41,11 @@ describe('POST /webhook/transcript', () => {
     expect(woke).toBe(1) // NOT nudged again for a deduped redelivery
   })
 
-  it('dedupes a redelivery with the SAME checksum under a DIFFERENT source id', async () => {
+  it('dedupes a redelivery with the SAME content under a DIFFERENT source id', async () => {
     await app.inject({ method: 'POST', url: '/webhook/transcript', payload: body })
     const res2 = await app.inject({
       method: 'POST', url: '/webhook/transcript',
-      payload: { customer_id: 'c1', source: { ...body.source, id: 'src_002' } },
+      payload: { ...body, id: 'src_002' },
     })
     expect(res2.statusCode).toBe(200)
     expect(JSON.parse(res2.body).deduped).toBe(true)
@@ -51,7 +53,7 @@ describe('POST /webhook/transcript', () => {
   })
 
   it('rejects a malformed payload with 4xx and creates NO rows (AGENTS.md #10)', async () => {
-    const res = await app.inject({ method: 'POST', url: '/webhook/transcript', payload: { customer_id: 'c1' } })
+    const res = await app.inject({ method: 'POST', url: '/webhook/transcript', payload: { id: 'src_001' } })
     expect(res.statusCode).toBeGreaterThanOrEqual(400)
     expect(res.statusCode).toBeLessThan(500)
     expect(countRows(db, 'sources')).toBe(0)
@@ -62,12 +64,37 @@ describe('POST /webhook/transcript', () => {
   it('rejects a payload with the wrong field types with 4xx and creates NO rows', async () => {
     const res = await app.inject({
       method: 'POST', url: '/webhook/transcript',
-      payload: { customer_id: 'c1', source: { id: 123, type: 'call_transcript', date: '2025-03-12', content: 'hi' } },
+      payload: { id: 123, type: 'call_transcript', date: '2025-03-12T10:30:00Z', participants: ['x'], content: 'hi' },
     })
     expect(res.statusCode).toBeGreaterThanOrEqual(400)
     expect(res.statusCode).toBeLessThan(500)
     expect(countRows(db, 'sources')).toBe(0)
     expect(countRows(db, 'processing_jobs')).toBe(0)
+  })
+
+  it('rejects a payload with no participants with 4xx and creates NO rows', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/webhook/transcript',
+      payload: { ...body, participants: [] },
+    })
+    expect(res.statusCode).toBeGreaterThanOrEqual(400)
+    expect(res.statusCode).toBeLessThan(500)
+    expect(countRows(db, 'sources')).toBe(0)
+    expect(countRows(db, 'processing_jobs')).toBe(0)
+  })
+
+  it('rejects a non-ISO date with 4xx and creates NO rows (AGENTS.md #3/#10)', async () => {
+    // A malformed source_date would sort lexicographically above real ISO dates and permanently
+    // hijack selectCurrentFact — reject it at the boundary before it is ever persisted.
+    const res = await app.inject({
+      method: 'POST', url: '/webhook/transcript',
+      payload: { ...body, date: 'zzzz' },
+    })
+    expect(res.statusCode).toBeGreaterThanOrEqual(400)
+    expect(res.statusCode).toBeLessThan(500)
+    expect(countRows(db, 'sources')).toBe(0)
+    expect(countRows(db, 'processing_jobs')).toBe(0)
+    expect(woke).toBe(0)
   })
 
   it('does not leak a stack trace in the error response', async () => {
