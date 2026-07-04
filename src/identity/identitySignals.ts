@@ -1,5 +1,5 @@
-import { locateEvidence } from '../extraction/evidenceMatcher.js'
-import type { EnvelopeField, ExtractionEnvelope } from '../schema/profile.js'
+import { locateEvidence } from '../extraction/evidenceMatcher'
+import type { EnvelopeField, ExtractionEnvelope } from '../schema/profile'
 
 export type IdentitySignalType = 'fein' | 'email' | 'phone' | 'business_name_state' | 'mailing_address'
 export type IdentitySignalStrength = 'hard' | 'supporting'

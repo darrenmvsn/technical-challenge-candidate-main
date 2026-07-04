@@ -1,4 +1,4 @@
-import type { ExtractedFieldCandidate } from '../schema/profile.js'
+import type { ExtractedFieldCandidate } from '../schema/profile'
 
 /** Machine-candidate selection only: source_date > confidence > extracted_at. Human approvals live in field_review_versions. */
 export function selectCurrentCandidate(candidates: ExtractedFieldCandidate[]): ExtractedFieldCandidate | undefined {

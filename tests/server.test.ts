@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { fireAndReport, startAdaptiveLoop } from '../src/server.js'
+import { fireAndReport, startAdaptiveLoop } from '../src/server'
 
 const flush = () => new Promise<void>(resolve => { setImmediate(resolve) })
 

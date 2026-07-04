@@ -1,4 +1,4 @@
-import type { DB } from '../sqlite.js'
+import type { DB } from '../sqlite'
 
 export interface JobRow {
   id: string; source_id: string; status: string; attempts: number

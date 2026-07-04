@@ -1,13 +1,13 @@
-import type { DB } from '../db/sqlite.js'
-import type { Clock } from '../clock.js'
-import { addMs } from '../clock.js'
-import type { OutboxRepo } from '../db/repos/outbox.js'
-import type { DraftsRepo } from '../db/repos/drafts.js'
-import type { LeaseClaimer } from '../lease/leaseClaimer.js'
-import type { BlobStore } from '../blob/blobStore.js'
-import type { FormType } from '../schema/profile.js'
-import type { FillMapping } from '../schema/forms.js'
-import { fillForm } from '../forms/fillForm.js'
+import type { DB } from '../db/sqlite'
+import type { Clock } from '../clock'
+import { addMs } from '../clock'
+import type { OutboxRepo } from '../db/repos/outbox'
+import type { DraftsRepo } from '../db/repos/drafts'
+import type { LeaseClaimer } from '../lease/leaseClaimer'
+import type { BlobStore } from '../blob/blobStore'
+import type { FormType } from '../schema/profile'
+import type { FillMapping } from '../schema/forms'
+import { fillForm } from '../forms/fillForm'
 
 export interface OutboxWorkerDeps {
   db: DB; outbox: OutboxRepo; drafts: DraftsRepo; blob: BlobStore; lease: LeaseClaimer

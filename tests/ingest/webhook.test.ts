@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
-import { buildWebhookApp } from '../../src/ingest/webhook.js'
-import { FixedClock } from '../../src/clock.js'
+import { openDb, migrate, type DB } from '../../src/db/sqlite'
+import { buildWebhookApp } from '../../src/ingest/webhook'
+import { FixedClock } from '../../src/clock'
 
 const body = {
   id: 'src_001', type: 'call_transcript', date: '2025-03-12T10:30:00Z',

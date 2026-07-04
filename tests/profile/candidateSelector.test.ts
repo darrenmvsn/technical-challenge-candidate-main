@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { selectCurrentCandidate } from '../../src/profile/candidateSelector.js'
-import type { ExtractedFieldCandidate } from '../../src/schema/profile.js'
+import { selectCurrentCandidate } from '../../src/profile/candidateSelector'
+import type { ExtractedFieldCandidate } from '../../src/schema/profile'
 
 const base: ExtractedFieldCandidate = {
   id: 'x',

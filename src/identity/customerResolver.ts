@@ -1,6 +1,6 @@
-import type { ExtractionEnvelope } from '../schema/profile.js'
-import { CustomerIdentityRepo, IdentitySignalConflictError } from '../db/repos/customerIdentity.js'
-import { identitySignalsFromEnvelope } from './identitySignals.js'
+import type { ExtractionEnvelope } from '../schema/profile'
+import { CustomerIdentityRepo, IdentitySignalConflictError } from '../db/repos/customerIdentity'
+import { identitySignalsFromEnvelope } from './identitySignals'
 
 export interface ResolveCtx { sourceId: string; now: string; transcript: string }
 

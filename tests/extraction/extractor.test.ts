@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import fixture from '../fixtures/llm/coastal_v1.json'
-import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
-import { CollectionItemsRepo } from '../../src/db/repos/collectionItems.js'
-import { extractFacts } from '../../src/extraction/extractor.js'
-import { ExtractionEnvelope } from '../../src/schema/profile.js'
-import { FixedClock } from '../../src/clock.js'
+import { openDb, migrate, type DB } from '../../src/db/sqlite'
+import { CollectionItemsRepo } from '../../src/db/repos/collectionItems'
+import { extractFacts } from '../../src/extraction/extractor'
+import { ExtractionEnvelope } from '../../src/schema/profile'
+import { FixedClock } from '../../src/clock'
 
 describe('extractFacts', () => {
   let db: DB, itemsRepo: CollectionItemsRepo

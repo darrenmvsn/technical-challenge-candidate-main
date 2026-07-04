@@ -1,4 +1,4 @@
-import type { MatchQuality } from '../schema/profile.js'
+import type { MatchQuality } from '../schema/profile'
 
 export interface EvidenceLocation {
   quality: MatchQuality

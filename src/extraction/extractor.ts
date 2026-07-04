@@ -1,9 +1,9 @@
-import type { Clock } from '../clock.js'
-import type { CollectionItemsRepo } from '../db/repos/collectionItems.js'
-import type { ExtractionEnvelope, ExtractedFieldCandidate, EnvelopeField } from '../schema/profile.js'
-import { locateEvidence } from './evidenceMatcher.js'
-import { resolveItemId } from '../profile/collectionIdentity.js'
-import { factIdFor } from '../util/hash.js'
+import type { Clock } from '../clock'
+import type { CollectionItemsRepo } from '../db/repos/collectionItems'
+import type { ExtractionEnvelope, ExtractedFieldCandidate, EnvelopeField } from '../schema/profile'
+import { locateEvidence } from './evidenceMatcher'
+import { resolveItemId } from '../profile/collectionIdentity'
+import { factIdFor } from '../util/hash'
 
 export interface ExtractCtx {
   customerId: string

@@ -1,6 +1,6 @@
-import type { DB } from '../db/sqlite.js'
-import { newLockToken } from '../util/id.js'
-import { addMs } from '../clock.js'
+import type { DB } from '../db/sqlite'
+import { newLockToken } from '../util/id'
+import { addMs } from '../clock'
 
 /**
  * Closed internal allowlist of tables `LeaseClaimer` is permitted to operate on

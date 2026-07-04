@@ -1,6 +1,6 @@
-import type { DB } from '../sqlite.js'
-import { newId } from '../../util/id.js'
-import type { IdentitySignal, IdentitySignalStrength, IdentitySignalType } from '../../identity/identitySignals.js'
+import type { DB } from '../sqlite'
+import { newId } from '../../util/id'
+import type { IdentitySignal, IdentitySignalStrength, IdentitySignalType } from '../../identity/identitySignals'
 
 /** Thrown when a HARD signal (fein/email) already belongs to a different customer. */
 export class IdentitySignalConflictError extends Error {

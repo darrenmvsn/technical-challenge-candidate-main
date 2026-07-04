@@ -1,6 +1,6 @@
-import type { CurrentFieldValue, FormType } from '../schema/profile.js'
-import type { FieldBinding, FillMapping, FormMapping, JsonValue, RenderResult } from '../schema/forms.js'
-import { STATIC_BINDINGS, COLLECTION_BINDINGS } from './bindings.js'
+import type { CurrentFieldValue, FormType } from '../schema/profile'
+import type { FieldBinding, FillMapping, FormMapping, JsonValue, RenderResult } from '../schema/forms'
+import { STATIC_BINDINGS, COLLECTION_BINDINGS } from './bindings'
 
 const val = (f: CurrentFieldValue | undefined): string | number | boolean | null => {
   if (!f) return null

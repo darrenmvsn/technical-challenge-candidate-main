@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
-import { ExtractedFieldCandidatesRepo } from '../../src/db/repos/extractedFieldCandidates.js'
-import { FieldReviewVersionsRepo } from '../../src/db/repos/fieldReviewVersions.js'
-import { currentProfileMap } from '../../src/profile/currentProfile.js'
-import type { ExtractedFieldCandidate } from '../../src/schema/profile.js'
+import { openDb, migrate, type DB } from '../../src/db/sqlite'
+import { ExtractedFieldCandidatesRepo } from '../../src/db/repos/extractedFieldCandidates'
+import { FieldReviewVersionsRepo } from '../../src/db/repos/fieldReviewVersions'
+import { currentProfileMap } from '../../src/profile/currentProfile'
+import type { ExtractedFieldCandidate } from '../../src/schema/profile'
 
 const candidate = (id: string, sourceDate: string, value: unknown): ExtractedFieldCandidate => ({
   id,

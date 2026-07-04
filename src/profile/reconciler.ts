@@ -1,12 +1,12 @@
-import type { DB } from '../db/sqlite.js'
-import type { Clock } from '../clock.js'
-import type { ExtractedFieldCandidatesRepo } from '../db/repos/extractedFieldCandidates.js'
-import type { FieldReviewVersionsRepo } from '../db/repos/fieldReviewVersions.js'
-import type { FieldConflictsRepo } from '../db/repos/fieldConflicts.js'
-import type { ExtractedFieldCandidate, FormType } from '../schema/profile.js'
-import { selectCurrentCandidate } from './candidateSelector.js'
-import { boundScalarPaths } from '../forms/renderers.js'
-import { factIdFor } from '../util/hash.js'
+import type { DB } from '../db/sqlite'
+import type { Clock } from '../clock'
+import type { ExtractedFieldCandidatesRepo } from '../db/repos/extractedFieldCandidates'
+import type { FieldReviewVersionsRepo } from '../db/repos/fieldReviewVersions'
+import type { FieldConflictsRepo } from '../db/repos/fieldConflicts'
+import type { ExtractedFieldCandidate, FormType } from '../schema/profile'
+import { selectCurrentCandidate } from './candidateSelector'
+import { boundScalarPaths } from '../forms/renderers'
+import { factIdFor } from '../util/hash'
 
 export interface ReconcileCtx {
   db: DB

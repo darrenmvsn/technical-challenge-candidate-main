@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it, expect } from 'vitest'
-import { fillForm } from '../../src/forms/fillForm.js'
-import { LocalBlobStore, MemoryBlobStore } from '../../src/blob/blobStore.js'
+import { fillForm } from '../../src/forms/fillForm'
+import { LocalBlobStore, MemoryBlobStore } from '../../src/blob/blobStore'
 
 describe('fillForm', () => {
   it('writes to a deterministic key derived from content', async () => {

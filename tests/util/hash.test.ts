@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { contentHash, itemIdFor, factIdFor } from '../../src/util/hash.js'
+import { contentHash, itemIdFor, factIdFor } from '../../src/util/hash'
 
 describe('contentHash', () => {
   it('is stable regardless of key order', () => {

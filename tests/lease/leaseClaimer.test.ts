@@ -2,9 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
-import { FixedClock, addMs } from '../../src/clock.js'
-import { LeaseClaimer } from '../../src/lease/leaseClaimer.js'
+import { openDb, migrate, type DB } from '../../src/db/sqlite'
+import { FixedClock, addMs } from '../../src/clock'
+import { LeaseClaimer } from '../../src/lease/leaseClaimer'
 
 function seedOutbox(db: DB, id: string, nextAttemptAt = '2025-01-01T00:00:00Z') {
   db.prepare(

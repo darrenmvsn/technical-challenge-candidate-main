@@ -1,4 +1,4 @@
-import type { DB } from '../sqlite.js'
+import type { DB } from '../sqlite'
 
 export class CollectionItemsRepo {
   constructor(private db: DB) {}

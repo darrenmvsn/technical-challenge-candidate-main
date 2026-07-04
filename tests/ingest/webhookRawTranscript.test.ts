@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import transcriptFixture from '../../transcripts.json'
-import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
-import { buildWebhookApp } from '../../src/ingest/webhook.js'
-import { FixedClock } from '../../src/clock.js'
+import { openDb, migrate, type DB } from '../../src/db/sqlite'
+import { buildWebhookApp } from '../../src/ingest/webhook'
+import { FixedClock } from '../../src/clock'
 
 function countRows(db: DB, table: 'sources' | 'processing_jobs'): number {
   return (db.prepare(`SELECT COUNT(*) n FROM ${table}`).get() as { n: number }).n

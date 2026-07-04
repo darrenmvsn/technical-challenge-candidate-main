@@ -1,6 +1,6 @@
-import type { Clock } from '../clock.js'
-import type { CollectionItemsRepo } from '../db/repos/collectionItems.js'
-import { itemIdFor } from '../util/hash.js'
+import type { Clock } from '../clock'
+import type { CollectionItemsRepo } from '../db/repos/collectionItems'
+import { itemIdFor } from '../util/hash'
 
 /**
  * Deterministic id (idempotent under reprocessing) + registry lookup: a re-seen IDENTICAL

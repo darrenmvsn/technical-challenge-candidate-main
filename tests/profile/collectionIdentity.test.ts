@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
-import { CollectionItemsRepo } from '../../src/db/repos/collectionItems.js'
-import { resolveItemId } from '../../src/profile/collectionIdentity.js'
-import { FixedClock } from '../../src/clock.js'
-import { itemIdFor } from '../../src/util/hash.js'
+import { openDb, migrate, type DB } from '../../src/db/sqlite'
+import { CollectionItemsRepo } from '../../src/db/repos/collectionItems'
+import { resolveItemId } from '../../src/profile/collectionIdentity'
+import { FixedClock } from '../../src/clock'
+import { itemIdFor } from '../../src/util/hash'
 
 describe('resolveItemId', () => {
   let db: DB, repo: CollectionItemsRepo

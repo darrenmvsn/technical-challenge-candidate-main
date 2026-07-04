@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { locateEvidence } from '../../src/extraction/evidenceMatcher.js'
+import { locateEvidence } from '../../src/extraction/evidenceMatcher'
 
 const T = 'We did about two and a half million last year. About two and a half million, roughly.'
 

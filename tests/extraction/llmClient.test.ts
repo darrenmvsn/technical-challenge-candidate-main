@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import fixture from '../fixtures/llm/coastal_v1.json'
-import { buildPrompt, MockLlmClient } from '../../src/extraction/llmClient.js'
+import { buildPrompt, MockLlmClient } from '../../src/extraction/llmClient'
 
 describe('MockLlmClient', () => {
   it('returns a schema-validated envelope from the canned fixture, without any network call', async () => {

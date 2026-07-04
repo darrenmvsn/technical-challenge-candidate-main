@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it, expect } from 'vitest'
-import { openDb, migrate } from '../../src/db/sqlite.js'
+import { openDb, migrate } from '../../src/db/sqlite'
 
 interface SqliteMasterRow {
   name: string

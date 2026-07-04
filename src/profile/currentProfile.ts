@@ -1,6 +1,6 @@
-import type { ExtractedFieldCandidatesRepo } from '../db/repos/extractedFieldCandidates.js'
-import type { FieldReviewVersionsRepo } from '../db/repos/fieldReviewVersions.js'
-import type { CurrentFieldValue } from '../schema/profile.js'
+import type { ExtractedFieldCandidatesRepo } from '../db/repos/extractedFieldCandidates'
+import type { FieldReviewVersionsRepo } from '../db/repos/fieldReviewVersions'
+import type { CurrentFieldValue } from '../schema/profile'
 
 export function currentProfileMap(
   candidates: ExtractedFieldCandidatesRepo,

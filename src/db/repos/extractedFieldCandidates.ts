@@ -1,6 +1,6 @@
-import type { DB } from '../sqlite.js'
-import type { ExtractedFieldCandidate } from '../../schema/profile.js'
-import { selectCurrentCandidate } from '../../profile/candidateSelector.js'
+import type { DB } from '../sqlite'
+import type { ExtractedFieldCandidate } from '../../schema/profile'
+import { selectCurrentCandidate } from '../../profile/candidateSelector'
 
 export class ExtractedFieldCandidatesRepo {
   constructor(private db: DB) {}

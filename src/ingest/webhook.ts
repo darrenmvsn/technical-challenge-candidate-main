@@ -1,10 +1,10 @@
 import Fastify, { type FastifyInstance } from 'fastify'
 import { z } from 'zod'
-import type { DB } from '../db/sqlite.js'
-import type { Clock } from '../clock.js'
-import { SourcesRepo, insertSourceAndJob } from '../db/repos/sources.js'
-import { contentHash } from '../util/hash.js'
-import { newId } from '../util/id.js'
+import type { DB } from '../db/sqlite'
+import type { Clock } from '../clock'
+import { SourcesRepo, insertSourceAndJob } from '../db/repos/sources'
+import { contentHash } from '../util/hash'
+import { newId } from '../util/id'
 
 export interface WebhookDeps { db: DB; clock: Clock; wake: () => void }
 

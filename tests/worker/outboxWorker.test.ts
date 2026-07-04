@@ -1,12 +1,12 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
-import { OutboxRepo } from '../../src/db/repos/outbox.js'
-import { DraftsRepo } from '../../src/db/repos/drafts.js'
-import { LeaseClaimer } from '../../src/lease/leaseClaimer.js'
-import { MemoryBlobStore, type BlobStore } from '../../src/blob/blobStore.js'
-import { OutboxWorker } from '../../src/worker/outboxWorker.js'
-import { FixedClock, addMs } from '../../src/clock.js'
-import { contentHash } from '../../src/util/hash.js'
+import { openDb, migrate, type DB } from '../../src/db/sqlite'
+import { OutboxRepo } from '../../src/db/repos/outbox'
+import { DraftsRepo } from '../../src/db/repos/drafts'
+import { LeaseClaimer } from '../../src/lease/leaseClaimer'
+import { MemoryBlobStore, type BlobStore } from '../../src/blob/blobStore'
+import { OutboxWorker } from '../../src/worker/outboxWorker'
+import { FixedClock, addMs } from '../../src/clock'
+import { contentHash } from '../../src/util/hash'
 
 // Every row below enqueues the { fein: 'A' } payload for c1/acord_125, so its content_hash is
 // the one fillForm will derive (AGENTS.md #9). Production enqueues this matching hash via

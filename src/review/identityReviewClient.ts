@@ -1,10 +1,10 @@
-import type { Clock } from '../clock.js'
-import type { SourcesRepo } from '../db/repos/sources.js'
-import type { ProcessingJobsRepo } from '../db/repos/jobs.js'
-import { CustomerIdentityRepo, IdentitySignalConflictError } from '../db/repos/customerIdentity.js'
-import { identitySignalsFromEnvelope } from '../identity/identitySignals.js'
-import { ExtractionEnvelope } from '../schema/profile.js'
-import { newId } from '../util/id.js'
+import type { Clock } from '../clock'
+import type { SourcesRepo } from '../db/repos/sources'
+import type { ProcessingJobsRepo } from '../db/repos/jobs'
+import { CustomerIdentityRepo, IdentitySignalConflictError } from '../db/repos/customerIdentity'
+import { identitySignalsFromEnvelope } from '../identity/identitySignals'
+import { ExtractionEnvelope } from '../schema/profile'
+import { newId } from '../util/id'
 
 export interface IdentityReviewDeps {
   sources: SourcesRepo

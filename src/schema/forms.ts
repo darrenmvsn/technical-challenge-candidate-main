@@ -1,4 +1,4 @@
-import type { FormType } from './profile.js'
+import type { FormType } from './profile'
 export type { FormType }
 
 /**

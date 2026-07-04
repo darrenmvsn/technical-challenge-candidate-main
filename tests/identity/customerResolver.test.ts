@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
-import { CustomerIdentityRepo } from '../../src/db/repos/customerIdentity.js'
-import { CustomerResolver } from '../../src/identity/customerResolver.js'
-import { FixedClock } from '../../src/clock.js'
-import { ExtractionEnvelope } from '../../src/schema/profile.js'
+import { openDb, migrate, type DB } from '../../src/db/sqlite'
+import { CustomerIdentityRepo } from '../../src/db/repos/customerIdentity'
+import { CustomerResolver } from '../../src/identity/customerResolver'
+import { FixedClock } from '../../src/clock'
+import { ExtractionEnvelope } from '../../src/schema/profile'
 
 describe('CustomerResolver', () => {
   let db: DB, identity: CustomerIdentityRepo, resolver: CustomerResolver

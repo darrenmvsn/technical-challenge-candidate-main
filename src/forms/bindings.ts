@@ -1,4 +1,4 @@
-import type { FormType } from '../schema/profile.js'
+import type { FormType } from '../schema/profile'
 
 export interface StaticBinding { form_field_path: string; profile_field_path: string }
 

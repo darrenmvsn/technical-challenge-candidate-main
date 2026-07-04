@@ -1,5 +1,5 @@
-import type { DB } from '../sqlite.js'
-import { ProcessingJobsRepo, type JobInsert } from './jobs.js'
+import type { DB } from '../sqlite'
+import { ProcessingJobsRepo, type JobInsert } from './jobs'
 
 export interface SourceRow {
   id: string; customer_id: string | null; type: string; source_date: string; received_at: string

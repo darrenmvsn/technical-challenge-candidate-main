@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { ExtractionEnvelope } from '../../src/schema/profile.js'
+import { ExtractionEnvelope } from '../../src/schema/profile'
 
 describe('ExtractionEnvelope', () => {
   it('accepts a present field with evidence', () => {

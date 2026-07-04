@@ -1,7 +1,7 @@
-import type { FormType } from '../schema/profile.js'
-import type { FillMapping } from '../schema/forms.js'
-import type { BlobStore } from '../blob/blobStore.js'
-import { contentHash } from '../util/hash.js'
+import type { FormType } from '../schema/profile'
+import type { FillMapping } from '../schema/forms'
+import type { BlobStore } from '../blob/blobStore'
+import { contentHash } from '../util/hash'
 
 /**
  * Stub for the real form-filling service. Receives the NESTED fill mapping (the README

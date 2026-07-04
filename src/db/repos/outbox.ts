@@ -1,7 +1,7 @@
-import type { DB } from '../sqlite.js'
-import type { FormType } from '../../schema/profile.js'
-import type { FillMapping } from '../../schema/forms.js'
-import { newId } from '../../util/id.js'
+import type { DB } from '../sqlite'
+import type { FormType } from '../../schema/profile'
+import type { FillMapping } from '../../schema/forms'
+import { newId } from '../../util/id'
 
 export interface OutboxRow {
   id: string; customer_id: string; form_type: string; draft_revision: number; payload_json: string

@@ -1,5 +1,5 @@
-import type { DB } from '../sqlite.js'
-import { newId } from '../../util/id.js'
+import type { DB } from '../sqlite'
+import { newId } from '../../util/id'
 
 export interface FieldConflictRow {
   id: string

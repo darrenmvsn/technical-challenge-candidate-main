@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { renderForm, reverseResolve, toFillMapping } from '../../src/forms/renderers.js'
-import type { CurrentFieldValue, ExtractedFieldCandidate, FieldReviewVersion } from '../../src/schema/profile.js'
+import { renderForm, reverseResolve, toFillMapping } from '../../src/forms/renderers'
+import type { CurrentFieldValue, ExtractedFieldCandidate, FieldReviewVersion } from '../../src/schema/profile'
 
 function candidate(field_path: string, value: unknown): ExtractedFieldCandidate {
   return {

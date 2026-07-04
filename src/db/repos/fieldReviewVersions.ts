@@ -1,6 +1,6 @@
-import type { DB } from '../sqlite.js'
-import type { FieldReviewVersion, Presence, ReviewAction } from '../../schema/profile.js'
-import { newId } from '../../util/id.js'
+import type { DB } from '../sqlite'
+import type { FieldReviewVersion, Presence, ReviewAction } from '../../schema/profile'
+import { newId } from '../../util/id'
 
 export interface InsertReviewVersion {
   customerId: string

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
-import { DraftsRepo } from '../../src/db/repos/drafts.js'
-import { OutboxRepo } from '../../src/db/repos/outbox.js'
+import { openDb, migrate, type DB } from '../../src/db/sqlite'
+import { DraftsRepo } from '../../src/db/repos/drafts'
+import { OutboxRepo } from '../../src/db/repos/outbox'
 
 describe('DraftsRepo + OutboxRepo', () => {
   let db: DB, drafts: DraftsRepo, outbox: OutboxRepo

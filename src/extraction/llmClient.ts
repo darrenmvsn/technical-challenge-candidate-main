@@ -1,6 +1,6 @@
 import { generateText, Output } from 'ai'
 import { openai } from '@ai-sdk/openai'
-import { ExtractionEnvelope } from '../schema/profile.js'
+import { ExtractionEnvelope } from '../schema/profile'
 
 // AGENTS.md invariant #2: this is the ONLY module allowed to import `ai`. All LLM access
 // elsewhere in the pipeline goes through the `LlmClient` interface below.

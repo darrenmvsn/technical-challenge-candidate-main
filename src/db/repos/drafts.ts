@@ -1,7 +1,7 @@
-import type { DB } from '../sqlite.js'
-import type { FormType } from '../../schema/profile.js'
-import type { FieldBinding, FormMapping } from '../../schema/forms.js'
-import { newId } from '../../util/id.js'
+import type { DB } from '../sqlite'
+import type { FormType } from '../../schema/profile'
+import type { FieldBinding, FormMapping } from '../../schema/forms'
+import { newId } from '../../util/id'
 
 export interface DraftRow {
   id: string; customer_id: string; form_type: string; revision: number; projected_json: string
