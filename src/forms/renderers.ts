@@ -1,19 +1,14 @@
-import type { Fact, FormType } from '../schema/profile.js'
+import type { CurrentFieldValue, FormType } from '../schema/profile.js'
 import type { FieldBinding, FillMapping, FormMapping, JsonValue, RenderResult } from '../schema/forms.js'
 import { STATIC_BINDINGS, COLLECTION_BINDINGS } from './bindings.js'
 
-/** Effective value: a human-approved correction (reviewed_value_json) overrides the machine value. */
-export function effectiveValueJson(f: Fact): string | null {
-  return f.review_status === 'approved' && f.reviewed_value_json !== null ? f.reviewed_value_json : f.value_json
-}
-const val = (f: Fact | undefined): string | number | null => {
+const val = (f: CurrentFieldValue | undefined): string | number | boolean | null => {
   if (!f) return null
-  const raw = effectiveValueJson(f)
-  return raw === null ? null : JSON.parse(raw)
+  return f.value_json === null ? null : JSON.parse(f.value_json)
 }
 
 /** Distinct item_ids present for a collection, sorted for deterministic positional order. */
-function itemIdsFor(collection: string, facts: Map<string, Fact>): string[] {
+function itemIdsFor(collection: string, facts: Map<string, CurrentFieldValue>): string[] {
   const ids = new Set<string>()
   for (const path of facts.keys()) {
     const m = path.match(new RegExp(`^${collection}\\.([^.]+)\\.`))
@@ -22,7 +17,7 @@ function itemIdsFor(collection: string, facts: Map<string, Fact>): string[] {
   return [...ids].sort()
 }
 
-export function renderForm(formType: FormType, facts: Map<string, Fact>): RenderResult {
+export function renderForm(formType: FormType, facts: Map<string, CurrentFieldValue>): RenderResult {
   const mapping: FormMapping = {}
   const fieldBindings: FieldBinding[] = []
 
