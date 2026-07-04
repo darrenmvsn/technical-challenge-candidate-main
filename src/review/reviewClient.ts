@@ -103,6 +103,12 @@ export class ReviewClient {
     // Everything below is synchronous SQLite work on `this.d.db` — no LLM/blob/network I/O ever
     // runs inside this transaction (AGENTS.md #5). `fillForm` is the worker's job (Task 14);
     // this only enqueues the nested payload it will later consume.
+    //
+    // Run as BEGIN IMMEDIATE (via `.immediate()` below): approval reads then writes several
+    // monotonic counters (field_review_versions.version, draft revision, outbox). Under a DEFERRED
+    // transaction two concurrent approvals could both read the same MAX(version) before either
+    // wrote and collide on UNIQUE(customer_id, field_path, version); IMMEDIATE takes the write lock
+    // at BEGIN so concurrent approvals serialize instead of racing.
     const tx = this.d.db.transaction((): ApproveResult => {
       const current = drafts.current(customerId, formType)
       if (!current) throw new Error(`no draft for ${customerId}/${formType}`)
@@ -214,7 +220,7 @@ export class ReviewClient {
       return { draftId: draftRow.id, revision: draftRow.revision, outboxId }
     })
 
-    const result = tx()
+    const result = tx.immediate()
     this.d.onEnqueued?.() // wake-on-commit, AFTER the txn commits
     return result
   }

@@ -1,13 +1,11 @@
 import { locateEvidence } from '../extraction/evidenceMatcher'
-import type { EnvelopeField, ExtractionEnvelope } from '../schema/profile'
+import { isWellFormedEmail, isWellFormedFein, type EnvelopeField, type ExtractionEnvelope } from '../schema/profile'
 
 export type IdentitySignalType = 'fein' | 'email' | 'phone' | 'business_name_state' | 'mailing_address'
 export type IdentitySignalStrength = 'hard' | 'supporting'
 export interface IdentitySignal { type: IdentitySignalType; value: string; strength: IdentitySignalStrength }
 
 type Address = { street: string; city: string; state: string; zip: string }
-
-const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 /**
  * Lowercase, collapse every run of non-alphanumeric characters to a single space, trim.
@@ -66,18 +64,16 @@ export function identitySignalsFromEnvelope(env: ExtractionEnvelope, transcript:
     return location.quality === 'exact' || location.quality === 'normalized'
   }
 
-  // fein -> digits only; keep only exactly 9 digits; strength hard
+  // fein -> digits only; keep only exactly 9 digits (isWellFormedFein); strength hard
   const fein = presentString(env.fein)
-  if (fein && verifyEvidence(fein.evidence) && verifyValue(fein.value)) {
-    const digits = fein.value.replace(/\D+/g, '')
-    if (digits.length === 9) signals.push({ type: 'fein', value: digits, strength: 'hard' })
+  if (fein && verifyEvidence(fein.evidence) && verifyValue(fein.value) && isWellFormedFein(fein.value)) {
+    signals.push({ type: 'fein', value: fein.value.replace(/\D+/g, ''), strength: 'hard' })
   }
 
-  // email -> lowercase trim; keep only local@domain-shaped values; strength hard
+  // email -> lowercase trim; keep only local@domain-shaped values (isWellFormedEmail); strength hard
   const email = presentString(env.policyholder_email)
-  if (email && verifyEvidence(email.evidence) && verifyValue(email.value)) {
-    const normalized = email.value.trim().toLowerCase()
-    if (EMAIL_SHAPE.test(normalized)) signals.push({ type: 'email', value: normalized, strength: 'hard' })
+  if (email && verifyEvidence(email.evidence) && verifyValue(email.value) && isWellFormedEmail(email.value)) {
+    signals.push({ type: 'email', value: email.value.trim().toLowerCase(), strength: 'hard' })
   }
 
   // phone -> digits only; keep only 10-digit US values for this fixture; strength supporting

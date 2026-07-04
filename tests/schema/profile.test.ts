@@ -44,4 +44,41 @@ describe('ExtractionEnvelope', () => {
     expect(parsed.business_name?.value).toBe('Coastal Roofing LLC')
     expect(parsed.policyholder_email?.value).toBe('mike.torres@coastalroofing.com')
   })
+
+  // A present fein/email is a HARD identity signal we can auto-merge customers on and it also
+  // reaches the ACORD form, so the raw candidate value must be format-checked at the boundary —
+  // not only inside identity resolution. Malformed *present* values are rejected before persistence.
+  it('accepts a present fein with exactly 9 digits (with or without punctuation)', () => {
+    expect(ExtractionEnvelope.parse({
+      fein: { value: '12-3456789', presence: 'present', confidence: 0.95, evidence: '12-3456789' },
+    }).fein?.value).toBe('12-3456789')
+    expect(ExtractionEnvelope.parse({
+      fein: { value: '123456789', presence: 'present', confidence: 0.95, evidence: '123456789' },
+    }).fein?.value).toBe('123456789')
+  })
+  it('rejects a present fein that is not 9 digits', () => {
+    expect(() => ExtractionEnvelope.parse({
+      fein: { value: 'not-a-fein', presence: 'present', confidence: 0.95, evidence: 'not-a-fein' },
+    })).toThrow(/fein/)
+    expect(() => ExtractionEnvelope.parse({
+      fein: { value: '12-345', presence: 'present', confidence: 0.95, evidence: '12-345' },
+    })).toThrow(/fein/)
+    expect(() => ExtractionEnvelope.parse({
+      fein: { value: '1234567890', presence: 'present', confidence: 0.95, evidence: '1234567890' },
+    })).toThrow(/fein/)
+  })
+  it('rejects a present policyholder_email that is not email-shaped', () => {
+    expect(() => ExtractionEnvelope.parse({
+      policyholder_email: { value: 'not-an-email', presence: 'present', confidence: 0.95, evidence: 'not-an-email' },
+    })).toThrow(/email/)
+    expect(() => ExtractionEnvelope.parse({
+      policyholder_email: { value: 'mike@coastal', presence: 'present', confidence: 0.95, evidence: 'mike@coastal' },
+    })).toThrow(/email/)
+  })
+  it('does not format-check fein/email that are absent (missing / needs_follow_up)', () => {
+    expect(ExtractionEnvelope.parse({
+      fein: { value: null, presence: 'missing', confidence: 0, evidence: null },
+      policyholder_email: { value: null, presence: 'needs_follow_up', confidence: 0.2, evidence: 'he will email it over' },
+    }).fein?.presence).toBe('missing')
+  })
 })

@@ -8,12 +8,31 @@ export type MatchQuality = 'exact' | 'normalized' | 'ambiguous' | 'none'
 export type FormType = 'acord_125' | 'acord_126'
 
 /**
+ * Format guards for the two HARD identity signals we can silently auto-merge two customers on
+ * (invariant #13). A *present* fein/email must be well-formed BEFORE it is persisted as a
+ * candidate and flows into review/fill — identity resolution already format-checks these, but
+ * the raw candidate value would otherwise reach the ACORD form unchecked. These are the single
+ * source of truth: `identitySignalsFromEnvelope` imports the same predicates so persistence and
+ * identity resolution can never drift apart.
+ */
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+export const isWellFormedFein = (value: string): boolean => value.replace(/\D+/g, '').length === 9
+export const isWellFormedEmail = (value: string): boolean => EMAIL_SHAPE.test(value.trim().toLowerCase())
+
+/** A present-value format check applied by `envelopeField` only when `presence === 'present'`. */
+export interface PresentFormat<V> { check: (value: V) => boolean; message: string }
+
+/**
  * One extracted field: value + why-it-is/isn't-there + confidence + provenance quote.
  * Invariant #6: `evidence` is `null` ONLY for `presence === 'missing'`. A cross-field
  * `superRefine` rejects a present/needs_follow_up/not_applicable field with null evidence,
  * and rejects a missing field carrying evidence — so the constraint can't be silently violated.
+ *
+ * `presentFormat` (optional) additionally rejects a `present` field whose non-null value fails a
+ * format check (e.g. a malformed FEIN/email), so bad hard-identity values never reach candidates.
+ * missing/needs_follow_up/not_applicable fields (null value) are unaffected.
  */
-export function envelopeField<T extends z.ZodTypeAny>(value: T) {
+export function envelopeField<T extends z.ZodTypeAny>(value: T, presentFormat?: PresentFormat<z.infer<T>>) {
   return z.object({
     value: value.nullable(),
     presence: Presence,
@@ -25,6 +44,9 @@ export function envelopeField<T extends z.ZodTypeAny>(value: T) {
     }
     if (field.presence !== 'missing' && field.evidence === null) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['evidence'], message: "evidence is required unless presence is 'missing'" })
+    }
+    if (presentFormat && field.presence === 'present' && field.value !== null && !presentFormat.check(field.value as z.infer<T>)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['value'], message: presentFormat.message })
     }
   })
 }
@@ -42,10 +64,10 @@ export const ExtractionEnvelope = z.object({
   policyholder_last_name: envelopeField(z.string()).optional(),
   business_name: envelopeField(z.string()).optional(),
   business_phone: envelopeField(z.string()).optional(),
-  policyholder_email: envelopeField(z.string()).optional(),
+  policyholder_email: envelopeField(z.string(), { check: isWellFormedEmail, message: 'policyholder_email must be a valid email address when present' }).optional(),
   dba_name: envelopeField(z.string()).optional(),
   entity_type: envelopeField(z.enum(['LLC', 'Corporation', 'SoleProprietor', 'Partnership'])).optional(),
-  fein: envelopeField(z.string()).optional(),
+  fein: envelopeField(z.string(), { check: isWellFormedFein, message: 'fein must contain exactly 9 digits when present' }).optional(),
   annual_gross_revenue: envelopeField(z.number()).optional(),
   annual_payroll: envelopeField(z.number()).optional(),
   employee_count_full_time: envelopeField(z.number().int()).optional(),

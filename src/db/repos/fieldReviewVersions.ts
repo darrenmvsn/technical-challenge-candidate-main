@@ -18,12 +18,18 @@ export class FieldReviewVersionsRepo {
 
   insertVersion(args: InsertReviewVersion): FieldReviewVersion {
     this.assertCandidateMatches(args.customerId, args.fieldPath, args.candidateId)
-    const next = this.nextVersion(args.customerId, args.fieldPath)
     const id = newId()
+    // Compute the next version INSIDE the INSERT so the MAX read and the write are a single write
+    // statement under SQLite's write lock: two concurrent approvals can't both read the same
+    // MAX(version) and then collide on UNIQUE(customer_id, field_path, version). (approveForm also
+    // runs BEGIN IMMEDIATE so the whole multi-row approval serializes against other writers.)
     this.db.prepare(`INSERT INTO field_review_versions
       (id, customer_id, field_path, version, candidate_id, value_json, presence, action, reviewed_by, reviewed_at)
-      VALUES (@id, @customerId, @fieldPath, @version, @candidateId, @valueJson, @presence, @action, @reviewedBy, @reviewedAt)`)
-      .run({ id, version: next, ...args })
+      SELECT @id, @customerId, @fieldPath,
+        COALESCE((SELECT MAX(version) FROM field_review_versions
+                  WHERE customer_id=@customerId AND field_path=@fieldPath), 0) + 1,
+        @candidateId, @valueJson, @presence, @action, @reviewedBy, @reviewedAt`)
+      .run({ id, ...args })
     return this.get(id)!
   }
 
@@ -44,13 +50,6 @@ export class FieldReviewVersionsRepo {
 
   get(id: string): FieldReviewVersion | undefined {
     return this.db.prepare('SELECT * FROM field_review_versions WHERE id=?').get(id) as FieldReviewVersion | undefined
-  }
-
-  private nextVersion(customerId: string, fieldPath: string): number {
-    const row = this.db.prepare(`SELECT COALESCE(MAX(version), 0) + 1 n
-      FROM field_review_versions WHERE customer_id=? AND field_path=?`)
-      .get(customerId, fieldPath) as { n: number }
-    return row.n
   }
 
   private assertCandidateMatches(customerId: string, fieldPath: string, candidateId: string): void {
