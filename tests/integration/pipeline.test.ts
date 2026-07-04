@@ -6,8 +6,10 @@ import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
 import { buildWebhookApp } from '../../src/ingest/webhook.js'
 import { SourcesRepo } from '../../src/db/repos/sources.js'
 import { ProcessingJobsRepo } from '../../src/db/repos/jobs.js'
-import { FactsRepo } from '../../src/db/repos/facts.js'
-import { ConflictsRepo } from '../../src/db/repos/conflicts.js'
+import { ExtractedFieldCandidatesRepo } from '../../src/db/repos/extractedFieldCandidates.js'
+import { FieldReviewVersionsRepo } from '../../src/db/repos/fieldReviewVersions.js'
+import { FieldConflictsRepo } from '../../src/db/repos/fieldConflicts.js'
+import { currentProfileMap } from '../../src/profile/currentProfile.js'
 import { CollectionItemsRepo } from '../../src/db/repos/collectionItems.js'
 import { DraftsRepo } from '../../src/db/repos/drafts.js'
 import { OutboxRepo } from '../../src/db/repos/outbox.js'
@@ -60,8 +62,9 @@ describe('end-to-end pipeline: ingest -> extract -> review -> approve -> fill, t
 
   function processor(llm: LlmClient) {
     return new Processor({
-      db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db), facts: new FactsRepo(db),
-      conflicts: new ConflictsRepo(db), items: new CollectionItemsRepo(db), drafts: new DraftsRepo(db),
+      db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db), candidates: new ExtractedFieldCandidatesRepo(db),
+      reviewVersions: new FieldReviewVersionsRepo(db), conflicts: new FieldConflictsRepo(db),
+      items: new CollectionItemsRepo(db), drafts: new DraftsRepo(db),
       outbox: new OutboxRepo(db), lease: new LeaseClaimer(db, 'processing_jobs'), llm,
       resolver: new CustomerResolver(new CustomerIdentityRepo(db)), clock, workerId: 'w', formTypes: [...formTypes],
     })
@@ -76,12 +79,13 @@ describe('end-to-end pipeline: ingest -> extract -> review -> approve -> fill, t
     // evidence resolves so the resolver admits the hard identity signal.
     const src001 = (transcripts as { id: string; date: string; content: string; participants: string[] }[]).find(t => t.id === 'src_001')!
 
-    const facts = new FactsRepo(db)
+    const candidates = new ExtractedFieldCandidatesRepo(db)
+    const reviewVersions = new FieldReviewVersionsRepo(db)
     const drafts = new DraftsRepo(db)
     const outbox = new OutboxRepo(db)
-    const conflicts = new ConflictsRepo(db)
+    const conflicts = new FieldConflictsRepo(db)
     const blob = new MemoryBlobStore()
-    const rc = new ReviewClient({ db, facts, drafts, outbox, conflicts, clock, formTypes: [...formTypes], onEnqueued: () => {} })
+    const rc = new ReviewClient({ db, candidates, reviewVersions, drafts, outbox, conflicts, clock, formTypes: [...formTypes], onEnqueued: () => {} })
     const worker = new OutboxWorker({ db, outbox, drafts, blob, lease: new LeaseClaimer(db, 'outbox'), clock, workerId: 'f' })
 
     // ==== 1. First transcript ingested through the REAL webhook route (validated, durable). ====
@@ -101,14 +105,16 @@ describe('end-to-end pipeline: ingest -> extract -> review -> approve -> fill, t
     expect(JSON.parse(draftBefore.projected_json).annual_gross_revenue).toBe(2500000)
     // Evidence really resolved against the real transcript text (not a stub sentence) —
     // proves the extraction step is genuinely wired to evidenceMatcher end to end.
-    const revenueFact = facts.byField(cid, 'annual_gross_revenue')[0]!
+    const revenueFact = candidates.byField(cid, 'annual_gross_revenue')[0]!
     expect(revenueFact.match_quality).toBe('exact')
     expect(revenueFact.evidence_span_start).not.toBeNull()
     expect(src001.content.slice(revenueFact.evidence_span_start!, revenueFact.evidence_span_end!)).toBe(revenueFact.evidence_quote)
 
     // ==== 2. Human approves the form (revenue currently 2.5M). ====
     const approved = rc.approveForm(cid, 'acord_125', { by: 'sarah' })
-    expect(facts.byField(cid, 'annual_gross_revenue').some(f => f.review_status === 'approved')).toBe(true)
+    // The approval is an immutable review VERSION, not a mutation of the candidate row.
+    expect(reviewVersions.latestByField(cid, 'annual_gross_revenue')!.action).toBe('approved')
+    expect(currentProfileMap(candidates, reviewVersions, cid).get('annual_gross_revenue')!.review_status).toBe('approved')
 
     // ==== PROPERTY 1: transcript 1 is fully processed and FILLED — a blob exists at the ====
     // ==== content-addressed key pdf/{customerId}/{formType}/{contentHash}. ====
@@ -143,34 +149,34 @@ describe('end-to-end pipeline: ingest -> extract -> review -> approve -> fill, t
     // from src_002 must resolve to a REAL evidence span, so a silent locateEvidence regression on
     // source 2 fails this acceptance gate. Both quotes appear verbatim in the synthetic
     // correction text, so the genuine expected quality is 'exact' (must NOT be 'none'/'ambiguous').
-    const revenueV2 = facts.byField(cid, 'annual_gross_revenue').find(f => f.source_id === 'src_002')!
+    const revenueV2 = candidates.byField(cid, 'annual_gross_revenue').find(f => f.source_id === 'src_002')!
     expect(revenueV2.match_quality).toBe('exact')
     expect(revenueV2.evidence_span_start).not.toBeNull()
     expect(res2Content.slice(revenueV2.evidence_span_start!, revenueV2.evidence_span_end!)).toBe(revenueV2.evidence_quote)
-    const payrollV2 = facts.byField(cid, 'annual_payroll').find(f => f.source_id === 'src_002')!
+    const payrollV2 = candidates.byField(cid, 'annual_payroll').find(f => f.source_id === 'src_002')!
     expect(payrollV2.match_quality).toBe('exact')
     expect(payrollV2.evidence_span_start).not.toBeNull()
     expect(res2Content.slice(payrollV2.evidence_span_start!, payrollV2.evidence_span_end!)).toBe(payrollV2.evidence_quote)
 
     // ==== PROPERTY 4: the disagreement surfaces a CONFLICT row, approval-gated. ====
-    // annual_gross_revenue's CURRENT fact was already approved (2.5M) when the newer,
-    // disagreeing candidate (2.8M) arrived -> the reconciler does NOT silently overwrite it; it
-    // opens an unresolved conflict against the approved fact instead.
+    // annual_gross_revenue's CURRENT value was already approved (2.5M, via a review version) when
+    // the newer, disagreeing candidate (2.8M) arrived -> the reconciler does NOT silently
+    // overwrite it; it opens an unresolved conflict against the approved review instead.
     const openConflicts = rc.listUnresolvedConflicts(cid)
     expect(openConflicts).toHaveLength(1)
     const revenueConflict = openConflicts.find(c => c.field_path === 'annual_gross_revenue')
     expect(revenueConflict).toBeTruthy()
-    expect(facts.get(revenueConflict!.current_fact_id)!.review_status).toBe('approved')
-    expect(JSON.parse(facts.get(revenueConflict!.current_fact_id)!.value_json!)).toBe(2500000)
-    expect(JSON.parse(facts.get(revenueConflict!.conflicting_fact_id)!.value_json!)).toBe(2800000)
+    expect(currentProfileMap(candidates, reviewVersions, cid).get('annual_gross_revenue')!.review_status).toBe('approved')
+    expect(JSON.parse(candidates.get(revenueConflict!.current_candidate_id)!.value_json!)).toBe(2500000)
+    expect(JSON.parse(candidates.get(revenueConflict!.conflicting_candidate_id)!.value_json!)).toBe(2800000)
 
-    // Contrast case proving the gate is APPROVAL-gated, not "any two disagreeing facts conflict":
+    // Contrast case proving the gate is APPROVAL-gated, not "any two disagreeing candidates conflict":
     // annual_payroll is extracted (needs_follow_up -> present) but is NOT bound to acord_125
     // (AGENTS.md scope guardrails), so approveForm never approved it. With nothing approved to
     // protect, the reconciler raises no conflict for it and the newer value simply becomes the
-    // current fact via ordinary selectCurrentFact precedence.
+    // current value via ordinary selectCurrentCandidate precedence.
     expect(openConflicts.some(c => c.field_path === 'annual_payroll')).toBe(false)
-    const payrollCurrent = facts.currentMap(cid).get('annual_payroll')!
+    const payrollCurrent = currentProfileMap(candidates, reviewVersions, cid).get('annual_payroll')!
     expect(payrollCurrent.review_status).not.toBe('approved')
     expect(JSON.parse(payrollCurrent.value_json!)).toBe(1750000)
 
@@ -190,11 +196,14 @@ describe('end-to-end pipeline: ingest -> extract -> review -> approve -> fill, t
     expect(firstAfterCorrection.superseded_by_revision).toBe(2) // superseded, never destroyed/mutated
     expect(await blob.get(filledFirst.pdf_ref!)).toEqual(firstBlobBytes) // original blob bytes untouched
 
-    // ==== 4. Reviewer accepts the correction: edits the CURRENT (approved) fact via ====
-    // approveForm's edit path, then explicitly resolves the conflict. A disagreeing machine
-    // fact never auto-overwrites an approved one — a human must act.
+    // ==== 4. Reviewer accepts the correction: edits the CURRENT (approved) value via ====
+    // approveForm's edit path. Because the edit value (2.8M) matches the open conflict's
+    // conflicting candidate, approveForm records an `accepted_conflict` review version and
+    // resolves the conflict itself — a disagreeing machine candidate never auto-overwrites an
+    // approved one, but accepting the correction and resolving the conflict are the SAME human act.
     const second = rc.approveForm(cid, 'acord_125', { edits: { annual_gross_revenue: 2800000 }, by: 'sarah' })
-    rc.resolveConflict(revenueConflict!.id, 'sarah')
+    expect(reviewVersions.latestByField(cid, 'annual_gross_revenue')!.action).toBe('accepted_conflict')
+    expect(conflicts.get(revenueConflict!.id)!.status).toBe('resolved')
     expect(rc.listUnresolvedConflicts(cid)).toHaveLength(0)
     expect(second.revision).toBe(2)
     expect(second.draftId).toBe(reprojected.id) // same (still needs_review) row, reprojected in place

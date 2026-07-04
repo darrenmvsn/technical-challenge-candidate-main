@@ -3,8 +3,9 @@ import type { Clock } from '../clock.js'
 import { addMs } from '../clock.js'
 import type { SourcesRepo } from '../db/repos/sources.js'
 import type { ProcessingJobsRepo } from '../db/repos/jobs.js'
-import type { FactsRepo } from '../db/repos/facts.js'
-import type { ConflictsRepo } from '../db/repos/conflicts.js'
+import type { ExtractedFieldCandidatesRepo } from '../db/repos/extractedFieldCandidates.js'
+import type { FieldReviewVersionsRepo } from '../db/repos/fieldReviewVersions.js'
+import type { FieldConflictsRepo } from '../db/repos/fieldConflicts.js'
 import type { CollectionItemsRepo } from '../db/repos/collectionItems.js'
 import type { DraftsRepo } from '../db/repos/drafts.js'
 import type { OutboxRepo } from '../db/repos/outbox.js'
@@ -16,9 +17,11 @@ import { CustomerResolver } from '../identity/customerResolver.js'
 import { extractFacts } from '../extraction/extractor.js'
 import { reconcile } from '../profile/reconciler.js'
 import { renderForm } from '../forms/renderers.js'
+import { currentProfileMap } from '../profile/currentProfile.js'
 
 export interface ProcessorDeps {
-  db: DB; sources: SourcesRepo; jobs: ProcessingJobsRepo; facts: FactsRepo; conflicts: ConflictsRepo
+  db: DB; sources: SourcesRepo; jobs: ProcessingJobsRepo; candidates: ExtractedFieldCandidatesRepo
+  reviewVersions: FieldReviewVersionsRepo; conflicts: FieldConflictsRepo
   items: CollectionItemsRepo; drafts: DraftsRepo; outbox: OutboxRepo; lease: LeaseClaimer; llm: LlmClient
   resolver: CustomerResolver
   clock: Clock; workerId: string; formTypes: FormType[]; leaseMs?: number; batch?: number; maxAttempts?: number
@@ -114,14 +117,14 @@ export class Processor {
             customerId, sourceId: source.id, sourceDate: source.source_date,
             transcript, clock: this.d.clock, itemsRepo: this.d.items,
           })
-          this.d.facts.insertMany(facts)
+          this.d.candidates.insertMany(facts)
           reconcile({
-            db: this.d.db, facts: this.d.facts, conflicts: this.d.conflicts, clock: this.d.clock,
-            customerId, formTypes: this.d.formTypes,
+            db: this.d.db, candidates: this.d.candidates, reviews: this.d.reviewVersions, conflicts: this.d.conflicts,
+            clock: this.d.clock, customerId, formTypes: this.d.formTypes,
           })
-          const currentFacts = this.d.facts.currentMap(customerId)
+          const currentProfile = currentProfileMap(this.d.candidates, this.d.reviewVersions, customerId)
           for (const ft of this.d.formTypes) {
-            const { mapping, fieldBindings } = renderForm(ft, currentFacts)
+            const { mapping, fieldBindings } = renderForm(ft, currentProfile)
             const before = this.d.drafts.current(customerId, ft)
             const draft = this.d.drafts.upsertProjection(customerId, ft, mapping, this.d.clock.now())
             this.d.drafts.saveBindings(draft.id, fieldBindings)

@@ -3,8 +3,9 @@ import fixture from '../fixtures/llm/coastal_v1.json'
 import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
 import { SourcesRepo, type SourceRow } from '../../src/db/repos/sources.js'
 import { ProcessingJobsRepo } from '../../src/db/repos/jobs.js'
-import { FactsRepo } from '../../src/db/repos/facts.js'
-import { ConflictsRepo } from '../../src/db/repos/conflicts.js'
+import { ExtractedFieldCandidatesRepo } from '../../src/db/repos/extractedFieldCandidates.js'
+import { FieldReviewVersionsRepo } from '../../src/db/repos/fieldReviewVersions.js'
+import { FieldConflictsRepo } from '../../src/db/repos/fieldConflicts.js'
 import { CollectionItemsRepo } from '../../src/db/repos/collectionItems.js'
 import { DraftsRepo } from '../../src/db/repos/drafts.js'
 import { OutboxRepo } from '../../src/db/repos/outbox.js'
@@ -74,8 +75,9 @@ describe('IdentityReviewClient', () => {
       extract: async () => { throw new Error('LLM must not be called when extraction_json is already stored') },
     }
     return new Processor({
-      db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db), facts: new FactsRepo(db),
-      conflicts: new ConflictsRepo(db), items: new CollectionItemsRepo(db), drafts: new DraftsRepo(db),
+      db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db), candidates: new ExtractedFieldCandidatesRepo(db),
+      reviewVersions: new FieldReviewVersionsRepo(db), conflicts: new FieldConflictsRepo(db),
+      items: new CollectionItemsRepo(db), drafts: new DraftsRepo(db),
       outbox: new OutboxRepo(db), lease: new LeaseClaimer(db, 'processing_jobs'),
       llm: throwingLlm, resolver: new CustomerResolver(identity),
       clock, workerId: 'w1', formTypes: ['acord_125'],
@@ -212,6 +214,6 @@ describe('IdentityReviewClient', () => {
     const source = new SourcesRepo(db).get('src_ambiguous')!
     expect(source.status).toBe('resolved')
     expect(source.customer_id).toBe(customerId)
-    expect(new FactsRepo(db).byField(customerId, 'annual_gross_revenue').length).toBeGreaterThan(0)
+    expect(new ExtractedFieldCandidatesRepo(db).byField(customerId, 'annual_gross_revenue').length).toBeGreaterThan(0)
   })
 })

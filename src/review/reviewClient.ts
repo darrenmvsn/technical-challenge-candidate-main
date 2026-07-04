@@ -1,17 +1,19 @@
 import type { DB } from '../db/sqlite.js'
 import type { Clock } from '../clock.js'
-import type { FactsRepo } from '../db/repos/facts.js'
+import type { ExtractedFieldCandidatesRepo } from '../db/repos/extractedFieldCandidates.js'
+import type { FieldReviewVersionsRepo } from '../db/repos/fieldReviewVersions.js'
 import type { DraftsRepo, DraftRow } from '../db/repos/drafts.js'
 import type { OutboxRepo } from '../db/repos/outbox.js'
-import type { ConflictsRepo, ConflictRow } from '../db/repos/conflicts.js'
+import type { FieldConflictsRepo, FieldConflictRow } from '../db/repos/fieldConflicts.js'
 import type { FormType } from '../schema/profile.js'
 import { renderForm, reverseResolve, toFillMapping } from '../forms/renderers.js'
 import { STATIC_BINDINGS } from '../forms/bindings.js'
-import { selectCurrentFact } from '../profile/factSelector.js'
+import { currentProfileMap } from '../profile/currentProfile.js'
 import { contentHash } from '../util/hash.js'
 
 export interface ReviewDeps {
-  db: DB; facts: FactsRepo; drafts: DraftsRepo; outbox: OutboxRepo; conflicts: ConflictsRepo
+  db: DB; candidates: ExtractedFieldCandidatesRepo; reviewVersions: FieldReviewVersionsRepo
+  drafts: DraftsRepo; outbox: OutboxRepo; conflicts: FieldConflictsRepo
   clock: Clock; formTypes: FormType[]; onEnqueued?: () => void
 }
 export interface ApproveOpts { edits?: Record<string, unknown>; by?: string }
@@ -26,15 +28,27 @@ export interface FieldProvenance {
   review_status: string
   /** A human has signed off on this field being blank (approved while non-'present'). */
   approved_blank: boolean
+  /** The version number of the review that produced this current value, or null if never reviewed. */
+  review_version: number | null
 }
 export interface DraftField { formFieldPath: string; value: unknown; provenance: FieldProvenance | null }
 export interface DraftView { draft: DraftRow; fields: DraftField[] }
+
+/** Pure equality check for two nullable JSON-encoded values (used to detect "edit == the conflicting candidate"). */
+function jsonEquals(a: string | null, b: string | null): boolean {
+  return a === b
+}
 
 /**
  * Human-in-the-loop core of the pipeline. `getDraft` builds the FLAT review surface (what a
  * reviewer edits) with per-field provenance; `approveForm` writes the NESTED fill mapping (what
  * the PDF worker consumes) — see AGENTS.md Style §flat-vs-nested. The two shapes are never
  * mixed: `projected_json`/`draft_field_bindings` stay flat, only the outbox payload is nested.
+ *
+ * Human decisions are recorded as immutable `FieldReviewVersion` rows (AGENTS.md invariant #7,
+ * rewritten by this ticket) — machine evidence in `extracted_field_candidates` is NEVER mutated
+ * by review. The current value for a field is always the COMPUTED overlay of candidate selection
+ * + latest review version (`currentProfileMap`), never a review column copied onto a candidate row.
  */
 export class ReviewClient {
   constructor(private d: ReviewDeps) {}
@@ -44,32 +58,34 @@ export class ReviewClient {
     if (!draft) return undefined
     const mapping = JSON.parse(draft.projected_json) as Record<string, unknown>
     const bindings = this.d.drafts.getBindings(draft.id)
-    const currentFacts = this.d.facts.currentMap(customerId)
+    const profile = currentProfileMap(this.d.candidates, this.d.reviewVersions, customerId)
     const fields: DraftField[] = Object.keys(mapping).map(formFieldPath => {
       const profilePath = reverseResolve(formType, formFieldPath, bindings)
-      const fact = profilePath ? currentFacts.get(profilePath) : undefined
+      const field = profilePath ? profile.get(profilePath) : undefined
       return {
         formFieldPath,
         value: mapping[formFieldPath],
-        provenance: fact ? {
-          quote: fact.evidence_quote,
-          span: fact.evidence_span_start !== null ? [fact.evidence_span_start, fact.evidence_span_end] : null,
-          confidence: fact.confidence,
-          presence: fact.presence,
-          review_status: fact.review_status,
+        provenance: field ? {
+          quote: field.value_candidate.evidence_quote,
+          span: field.value_candidate.evidence_span_start !== null
+            ? [field.value_candidate.evidence_span_start, field.value_candidate.evidence_span_end]
+            : null,
+          confidence: field.value_candidate.confidence,
+          presence: field.presence,
+          review_status: field.review_status,
           // the composite reviewers care about: a human signed off on leaving this blank
-          approved_blank: fact.review_status === 'approved' && fact.presence !== 'present',
+          approved_blank: field.approved_blank,
+          review_version: field.review?.version ?? null,
         } : null,
       }
     })
     return { draft, fields }
   }
 
-  listUnresolvedConflicts(customerId: string): ConflictRow[] { return this.d.conflicts.listUnresolved(customerId) }
-  resolveConflict(id: string, by: string): void { this.d.conflicts.resolve(id, by, this.d.clock.now()) }
+  listUnresolvedConflicts(customerId: string): FieldConflictRow[] { return this.d.conflicts.listUnresolved(customerId) }
 
   approveForm(customerId: string, formType: FormType, opts: ApproveOpts = {}): ApproveResult {
-    const { facts, drafts, outbox, clock } = this.d
+    const { candidates, reviewVersions, conflicts, drafts, outbox, clock } = this.d
     const by = opts.by ?? 'reviewer'
     const now = clock.now()
 
@@ -81,35 +97,61 @@ export class ReviewClient {
       if (!current) throw new Error(`no draft for ${customerId}/${formType}`)
       const bindings = drafts.getBindings(current.id)
 
-      // 1. Resolve + apply edits (array paths via per-draft bindings, scalars via static).
-      //    Edit lands on the CURRENT fact (selectCurrentFact), not an arbitrary row.
+      const profile = currentProfileMap(candidates, reviewVersions, customerId)
+      const openConflicts = conflicts.listUnresolved(customerId)
+
+      // 1. Resolve + apply edits (array paths via per-draft bindings, scalars via static). An edit
+      //    that matches an already-open conflict's DISAGREEING candidate is treated as accepting
+      //    that correction (`accepted_conflict`) and resolves the conflict; otherwise it is a plain
+      //    human edit against the current value candidate.
       const editedPaths: string[] = []
       for (const [formFieldPath, value] of Object.entries(opts.edits ?? {})) {
         const profilePath = reverseResolve(formType, formFieldPath, bindings)
         if (!profilePath) throw new Error(`unbound edit: ${formFieldPath}`)
-        const target = selectCurrentFact(facts.byField(customerId, profilePath))
-        if (!target) throw new Error(`no fact for ${profilePath}`)
-        facts.markApproved(target.id, JSON.stringify(value), by, now)
+        const currentField = profile.get(profilePath)
+        if (!currentField) throw new Error(`no candidate for ${profilePath}`)
+
+        const openConflict = openConflicts.find(c => c.field_path === profilePath)
+        const conflictingCandidate = openConflict ? candidates.get(openConflict.conflicting_candidate_id) : undefined
+        const editValueJson = JSON.stringify(value)
+
+        if (openConflict && conflictingCandidate && jsonEquals(editValueJson, conflictingCandidate.value_json)) {
+          const version = reviewVersions.insertVersion({
+            customerId, fieldPath: profilePath, candidateId: openConflict.conflicting_candidate_id,
+            valueJson: editValueJson, presence: 'present', action: 'accepted_conflict',
+            reviewedBy: by, reviewedAt: now,
+          })
+          conflicts.resolve(openConflict.id, version.id, by, now)
+        } else {
+          reviewVersions.insertVersion({
+            customerId, fieldPath: profilePath, candidateId: currentField.value_candidate.id,
+            valueJson: editValueJson, presence: 'present', action: 'edited',
+            reviewedBy: by, reviewedAt: now,
+          })
+        }
         editedPaths.push(profilePath)
       }
 
-      // 2. Approve EVERY form-bound current fact (not just edits). A field that was never
+      // 2. Approve EVERY form-bound current field (not just edits). A field that was never
       //    extracted (presence 'missing'/'needs_follow_up') is approved with its existing null
       //    value -> the read-side `approved_blank` state (sign-off on leaving it blank).
       //    Reviewer-initiated presence flips (`markNotApplicable`) are out of scope (deferred).
-      const currentFacts = facts.currentMap(customerId)
-      const boundPaths = new Set(renderForm(formType, currentFacts).fieldBindings.map(b => b.profile_field_path))
-      for (const [path, fact] of currentFacts) {
-        if (boundPaths.has(path) && fact.review_status !== 'approved') {
-          facts.markApproved(fact.id, fact.reviewed_value_json ?? fact.value_json, by, now)
-        }
+      const boundPaths = new Set(renderForm(formType, profile).fieldBindings.map(b => b.profile_field_path))
+      for (const [path, field] of profile) {
+        if (!boundPaths.has(path) || editedPaths.includes(path)) continue
+        reviewVersions.insertVersion({
+          customerId, fieldPath: path, candidateId: field.value_candidate.id,
+          valueJson: field.value_json, presence: field.presence,
+          action: field.presence === 'present' ? 'approved' : 'approved_blank',
+          reviewedBy: by, reviewedAt: now,
+        })
       }
 
       // 3. Re-project from the just-approved state. `mapping` is FLAT (the human review surface
       //    + draft projection). `fillMapping` is the NESTED fill_form contract shape the PDF
       //    service consumes; the outbox carries it and content_hash is computed over it so the
       //    stored hash matches fillForm's content-addressed blob key.
-      const fresh = facts.currentMap(customerId)
+      const fresh = currentProfileMap(candidates, reviewVersions, customerId)
       const { mapping, fieldBindings } = renderForm(formType, fresh)
       const fillMapping = toFillMapping(mapping)
       const hash = contentHash({ customerId, formType, mapping: fillMapping })

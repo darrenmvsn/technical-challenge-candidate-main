@@ -4,8 +4,9 @@ import v2Fixture from '../fixtures/llm/coastal_v2.json'
 import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
 import { SourcesRepo, insertSourceAndJob } from '../../src/db/repos/sources.js'
 import { ProcessingJobsRepo } from '../../src/db/repos/jobs.js'
-import { FactsRepo } from '../../src/db/repos/facts.js'
-import { ConflictsRepo } from '../../src/db/repos/conflicts.js'
+import { ExtractedFieldCandidatesRepo } from '../../src/db/repos/extractedFieldCandidates.js'
+import { FieldReviewVersionsRepo } from '../../src/db/repos/fieldReviewVersions.js'
+import { FieldConflictsRepo } from '../../src/db/repos/fieldConflicts.js'
 import { CollectionItemsRepo } from '../../src/db/repos/collectionItems.js'
 import { DraftsRepo } from '../../src/db/repos/drafts.js'
 import { OutboxRepo } from '../../src/db/repos/outbox.js'
@@ -86,7 +87,8 @@ describe('Processor.drainOnce', () => {
   function makeProcessor(canned: unknown = v1id) {
     return new Processor({
       db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db),
-      facts: new FactsRepo(db), conflicts: new ConflictsRepo(db), items: new CollectionItemsRepo(db),
+      candidates: new ExtractedFieldCandidatesRepo(db), reviewVersions: new FieldReviewVersionsRepo(db),
+      conflicts: new FieldConflictsRepo(db), items: new CollectionItemsRepo(db),
       drafts: new DraftsRepo(db), outbox: new OutboxRepo(db), lease: new LeaseClaimer(db, 'processing_jobs'),
       llm: new MockLlmClient(canned), resolver: new CustomerResolver(new CustomerIdentityRepo(db)),
       clock, workerId: 'w1', formTypes: ['acord_125'],
@@ -110,7 +112,7 @@ describe('Processor.drainOnce', () => {
     expect(n).toBe(1)
     const cid = resolvedCustomer(sourceId)
     expect(new SourcesRepo(db).get(sourceId)!.status).toBe('resolved')
-    const rev = new FactsRepo(db).byField(cid, 'annual_gross_revenue')
+    const rev = new ExtractedFieldCandidatesRepo(db).byField(cid, 'annual_gross_revenue')
     expect(rev.length).toBeGreaterThan(0)
     const draft = new DraftsRepo(db).current(cid, 'acord_125')
     expect(draft).toBeTruthy()
@@ -148,7 +150,7 @@ describe('Processor.drainOnce', () => {
     // writes (via resolveItemId for the fixture's `claims` collection) are inside the SAME
     // transaction as everything else, not committed independently before the fence.
     expect(db.prepare('SELECT COUNT(*) n FROM customers').get()).toMatchObject({ n: 0 })
-    expect(db.prepare('SELECT COUNT(*) n FROM facts').get()).toMatchObject({ n: 0 })
+    expect(db.prepare('SELECT COUNT(*) n FROM extracted_field_candidates').get()).toMatchObject({ n: 0 })
     expect(db.prepare('SELECT COUNT(*) n FROM form_drafts').get()).toMatchObject({ n: 0 })
     expect(db.prepare('SELECT COUNT(*) n FROM collection_items').get()).toMatchObject({ n: 0 })
     expect(new SourcesRepo(db).get(sourceId)!.status).toBe('received')
@@ -189,7 +191,8 @@ describe('Processor.drainOnce', () => {
     })
     const proc2 = new Processor({
       db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db),
-      facts: new FactsRepo(db), conflicts: new ConflictsRepo(db), items: new CollectionItemsRepo(db),
+      candidates: new ExtractedFieldCandidatesRepo(db), reviewVersions: new FieldReviewVersionsRepo(db),
+      conflicts: new FieldConflictsRepo(db), items: new CollectionItemsRepo(db),
       drafts: new DraftsRepo(db), outbox: new OutboxRepo(db), lease: new LeaseClaimer(db, 'processing_jobs'),
       llm: new MockLlmClient(v2id), resolver: new CustomerResolver(new CustomerIdentityRepo(db)),
       clock, workerId: 'w2', formTypes: ['acord_125'],

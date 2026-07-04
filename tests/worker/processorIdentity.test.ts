@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { openDb, migrate, type DB } from '../../src/db/sqlite.js'
 import { SourcesRepo, insertSourceAndJob } from '../../src/db/repos/sources.js'
 import { ProcessingJobsRepo } from '../../src/db/repos/jobs.js'
-import { FactsRepo } from '../../src/db/repos/facts.js'
-import { ConflictsRepo } from '../../src/db/repos/conflicts.js'
+import { ExtractedFieldCandidatesRepo } from '../../src/db/repos/extractedFieldCandidates.js'
+import { FieldReviewVersionsRepo } from '../../src/db/repos/fieldReviewVersions.js'
+import { FieldConflictsRepo } from '../../src/db/repos/fieldConflicts.js'
 import { CollectionItemsRepo } from '../../src/db/repos/collectionItems.js'
 import { DraftsRepo } from '../../src/db/repos/drafts.js'
 import { OutboxRepo } from '../../src/db/repos/outbox.js'
@@ -21,8 +22,9 @@ describe('Processor identity resolution', () => {
 
   function makeProcessor(canned: unknown) {
     return new Processor({
-      db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db), facts: new FactsRepo(db),
-      conflicts: new ConflictsRepo(db), items: new CollectionItemsRepo(db), drafts: new DraftsRepo(db),
+      db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db), candidates: new ExtractedFieldCandidatesRepo(db),
+      reviewVersions: new FieldReviewVersionsRepo(db), conflicts: new FieldConflictsRepo(db),
+      items: new CollectionItemsRepo(db), drafts: new DraftsRepo(db),
       outbox: new OutboxRepo(db), lease: new LeaseClaimer(db, 'processing_jobs'),
       llm: new MockLlmClient(canned), resolver: new CustomerResolver(new CustomerIdentityRepo(db)),
       clock, workerId: 'w1', formTypes: ['acord_125'],
@@ -50,7 +52,7 @@ describe('Processor identity resolution', () => {
     const source = new SourcesRepo(db).get('src_001')!
     expect(source.customer_id).toBeTruthy()
     expect(source.status).toBe('resolved')
-    expect(new FactsRepo(db).byField(source.customer_id!, 'annual_gross_revenue')).toHaveLength(1)
+    expect(new ExtractedFieldCandidatesRepo(db).byField(source.customer_id!, 'annual_gross_revenue')).toHaveLength(1)
   })
 
   it('does not insert customer-scoped facts when identity is ambiguous', async () => {
@@ -77,6 +79,6 @@ describe('Processor identity resolution', () => {
     }
     expect(await makeProcessor(canned).drainOnce()).toBe(1)
     expect(new SourcesRepo(db).get('src_ambiguous')!.status).toBe('identity_needs_review')
-    expect(db.prepare('SELECT COUNT(*) n FROM facts').get()).toMatchObject({ n: 0 })
+    expect(db.prepare('SELECT COUNT(*) n FROM extracted_field_candidates').get()).toMatchObject({ n: 0 })
   })
 })
