@@ -75,6 +75,22 @@ describe('ReviewClient.approveForm', () => {
     expect(wake).toHaveBeenCalledOnce()
   })
 
+  it('does not present stale machine evidence as provenance for a human-only edit', () => {
+    const res = rc.approveForm('c1', 'acord_125', { edits: { annual_gross_revenue: 2800000 }, by: 'sarah' })
+    const view = rc.getDraft('c1', 'acord_125')!
+    expect(view.draft.id).toBe(res.draftId)
+    const revenue = view.fields.find(f => f.formFieldPath === 'annual_gross_revenue')!
+    expect(revenue.value).toBe(2800000)
+    expect(revenue.provenance?.value_source).toBe('human_review')
+    expect(revenue.provenance?.quote).toBeNull()
+    expect(revenue.provenance?.span).toBeNull()
+    expect(revenue.provenance?.confidence).toBeNull()
+    expect(revenue.provenance?.review_action).toBe('edited')
+    expect(revenue.provenance?.reviewed_by).toBe('sarah')
+    expect(revenue.provenance?.reviewed_at).toBe('2025-03-16T00:00:00Z')
+    expect(revenue.provenance?.review_version).toBe(1)
+  })
+
   it('approving a form creates field review versions and does not mutate extracted candidates', () => {
     const res = rc.approveForm('c1', 'acord_125', { by: 'sarah' })
     const review = reviewVersions.latestByField('c1', 'annual_gross_revenue')!

@@ -5,7 +5,7 @@ import type { FieldReviewVersionsRepo } from '../db/repos/fieldReviewVersions.js
 import type { DraftsRepo, DraftRow } from '../db/repos/drafts.js'
 import type { OutboxRepo } from '../db/repos/outbox.js'
 import type { FieldConflictsRepo, FieldConflictRow } from '../db/repos/fieldConflicts.js'
-import type { FormType } from '../schema/profile.js'
+import type { CurrentFieldValue, FormType, ReviewAction } from '../schema/profile.js'
 import { renderForm, reverseResolve, toFillMapping } from '../forms/renderers.js'
 import { STATIC_BINDINGS } from '../forms/bindings.js'
 import { currentProfileMap } from '../profile/currentProfile.js'
@@ -23,16 +23,43 @@ export interface ApproveResult { draftId: string; revision: number; outboxId: st
 export interface FieldProvenance {
   quote: string | null
   span: [number, number | null] | null
-  confidence: number
+  confidence: number | null
   presence: string
   review_status: string
+  value_source: 'machine_evidence' | 'human_review'
   /** A human has signed off on this field being blank (approved while non-'present'). */
   approved_blank: boolean
   /** The version number of the review that produced this current value, or null if never reviewed. */
   review_version: number | null
+  review_action: ReviewAction | null
+  reviewed_by: string | null
+  reviewed_at: string | null
 }
 export interface DraftField { formFieldPath: string; value: unknown; provenance: FieldProvenance | null }
 export interface DraftView { draft: DraftRow; fields: DraftField[] }
+
+function provenanceFor(field: CurrentFieldValue): FieldProvenance {
+  const humanOnlyValue = field.review !== null && (
+    field.review.action === 'approved_blank' ||
+    field.review.value_json !== field.value_candidate.value_json ||
+    field.review.presence !== field.value_candidate.presence
+  )
+  return {
+    quote: humanOnlyValue ? null : field.value_candidate.evidence_quote,
+    span: humanOnlyValue || field.value_candidate.evidence_span_start === null
+      ? null
+      : [field.value_candidate.evidence_span_start, field.value_candidate.evidence_span_end],
+    confidence: humanOnlyValue ? null : field.value_candidate.confidence,
+    presence: field.presence,
+    review_status: field.review_status,
+    value_source: humanOnlyValue ? 'human_review' : 'machine_evidence',
+    approved_blank: field.approved_blank,
+    review_version: field.review?.version ?? null,
+    review_action: field.review?.action ?? null,
+    reviewed_by: field.review?.reviewed_by ?? null,
+    reviewed_at: field.review?.reviewed_at ?? null,
+  }
+}
 
 /**
  * Human-in-the-loop core of the pipeline. `getDraft` builds the FLAT review surface (what a
@@ -60,18 +87,7 @@ export class ReviewClient {
       return {
         formFieldPath,
         value: mapping[formFieldPath],
-        provenance: field ? {
-          quote: field.value_candidate.evidence_quote,
-          span: field.value_candidate.evidence_span_start !== null
-            ? [field.value_candidate.evidence_span_start, field.value_candidate.evidence_span_end]
-            : null,
-          confidence: field.value_candidate.confidence,
-          presence: field.presence,
-          review_status: field.review_status,
-          // the composite reviewers care about: a human signed off on leaving this blank
-          approved_blank: field.approved_blank,
-          review_version: field.review?.version ?? null,
-        } : null,
+        provenance: field ? provenanceFor(field) : null,
       }
     })
     return { draft, fields }
