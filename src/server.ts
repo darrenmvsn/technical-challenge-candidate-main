@@ -1,4 +1,7 @@
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { openDb, migrate } from './db/sqlite.js'
+import type { DB } from './db/sqlite.js'
 import { SystemClock } from './clock.js'
 import { buildWebhookApp } from './ingest/webhook.js'
 import { SourcesRepo } from './db/repos/sources.js'
@@ -9,7 +12,7 @@ import { CollectionItemsRepo } from './db/repos/collectionItems.js'
 import { DraftsRepo } from './db/repos/drafts.js'
 import { OutboxRepo } from './db/repos/outbox.js'
 import { LeaseClaimer } from './lease/leaseClaimer.js'
-import { MemoryBlobStore } from './blob/blobStore.js'
+import { LocalBlobStore } from './blob/blobStore.js'
 import { AiSdkLlmClient, MockLlmClient } from './extraction/llmClient.js'
 import { Processor } from './worker/processor.js'
 import { OutboxWorker } from './worker/outboxWorker.js'
@@ -18,33 +21,50 @@ import type { FormType } from './schema/profile.js'
 
 // Composition root — no business logic here, only wiring the real dependency graph together (DI).
 
-const clock = new SystemClock()
-const db = openDb(process.env.DB_PATH ?? 'data/acord.db')
-migrate(db)
+export interface AdaptiveLoopOptions {
+  initialMs?: number
+  minMs?: number
+  maxMs?: number
+  setTimeout?: (cb: () => void, ms: number) => unknown
+  onError?: (err: unknown) => void
+}
 
-const formTypes: FormType[] = ['acord_125', 'acord_126']
-const blob = new MemoryBlobStore()
-const llm = process.env.LLM_LIVE === '1' ? new AiSdkLlmClient() : new MockLlmClient({})
+export interface ServerRuntime {
+  db: DB
+  processor: Processor
+  outboxWorker: OutboxWorker
+  reviewClient: ReviewClient
+  app: ReturnType<typeof buildWebhookApp>
+}
 
-const processor = new Processor({
-  db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db), facts: new FactsRepo(db),
-  conflicts: new ConflictsRepo(db), items: new CollectionItemsRepo(db), drafts: new DraftsRepo(db),
-  lease: new LeaseClaimer(db, 'processing_jobs'), llm, clock, workerId: 'proc-1', formTypes,
-})
-const outboxWorker = new OutboxWorker({
-  db, outbox: new OutboxRepo(db), drafts: new DraftsRepo(db), blob,
-  lease: new LeaseClaimer(db, 'outbox'), clock, workerId: 'fill-1',
-})
+export let reviewClient: ReviewClient | undefined
 
-// The human-review surface. onEnqueued is the spec's PRIMARY wake-on-commit path: an approval
-// nudges the fill worker immediately (the poll below is only the backstop). Not yet wired to an
-// HTTP route (out of scope for this ticket — see file structure); exported for whatever review
-// surface consumes it next.
-export const reviewClient = new ReviewClient({
-  db, facts: new FactsRepo(db), drafts: new DraftsRepo(db), outbox: new OutboxRepo(db),
-  conflicts: new ConflictsRepo(db), clock, formTypes,
-  onEnqueued: () => { void outboxWorker.drainOnce() },
-})
+export function fireAndReport(run: () => Promise<unknown>, onError = defaultBackgroundError): void {
+  void run().catch(onError)
+}
+
+export function startAdaptiveLoop(run: () => Promise<number>, opts: AdaptiveLoopOptions = {}): void {
+  const min = opts.minMs ?? 1000
+  const max = opts.maxMs ?? 30_000
+  const scheduler = opts.setTimeout ?? ((cb: () => void, ms: number) => setTimeout(cb, ms))
+  const onError = opts.onError ?? defaultBackgroundError
+  const startMs = opts.initialMs ?? min
+
+  const tick = (idle: number): void => {
+    void run()
+      .then(n => {
+        const next = n > 0 ? min : Math.min(idle * 2, max)
+        scheduler(() => { tick(next) }, next)
+      })
+      .catch(err => {
+        onError(err)
+        const next = Math.min(idle * 2, max)
+        scheduler(() => { tick(next) }, next)
+      })
+  }
+
+  tick(startMs)
+}
 
 /**
  * Adaptive backstop poll (wake-on-commit calls drainOnce directly elsewhere).
@@ -57,26 +77,80 @@ export const reviewClient = new ReviewClient({
  * finding work and resetting `idle` to `min` would also shrink the outbox loop's next
  * `setTimeout` delay even though the outbox queue was empty and had legitimately backed off,
  * and vice versa — two independent queues silently coupled through one shared piece of mutable
- * state. Fixed by threading `idle` through the recursive call as a parameter instead of closing
- * over a shared outer variable, so each `loop()` invocation below owns an independent backoff
- * sequence.
+ * state. `startAdaptiveLoop()` threads `idle` through each recursive call, so each invocation
+ * owns an independent backoff sequence. It also catches rejected drains and schedules the next
+ * poll, so one transient worker error cannot permanently stop a queue.
  */
-function loop(run: () => Promise<number>, idle: number, min = 1000, max = 30_000): void {
-  void run().then(n => {
-    const next = n > 0 ? min : Math.min(idle * 2, max)
-    setTimeout(() => loop(run, next, min, max), next)
-  })
-}
-loop(() => processor.drainOnce(), 1000)
-loop(() => outboxWorker.drainOnce(), 1000)
+export function startServer(env: NodeJS.ProcessEnv = process.env): ServerRuntime {
+  const clock = new SystemClock()
+  const db = openDb(env.DB_PATH ?? 'data/acord.db')
+  migrate(db)
 
-const app = buildWebhookApp({ db, clock, wake: () => { void processor.drainOnce() } })
-app.listen({ port: Number(process.env.PORT ?? 8080) })
-  .then(() => console.log('webhook up'))
-  .catch((err: unknown) => {
-    // Production error posture: never swallow — an unhandled `listen()` rejection (e.g. the
-    // port is already in use) must be visible and must fail the process, not vanish into an
-    // unhandled-rejection warning.
-    console.error('failed to start webhook server:', err)
-    process.exitCode = 1
+  const formTypes: FormType[] = ['acord_125', 'acord_126']
+  const blob = new LocalBlobStore(env.BLOB_PATH ?? 'data/blob')
+  const llm = env.LLM_LIVE === '1' ? new AiSdkLlmClient() : new MockLlmClient({})
+
+  const processor = new Processor({
+    db, sources: new SourcesRepo(db), jobs: new ProcessingJobsRepo(db), facts: new FactsRepo(db),
+    conflicts: new ConflictsRepo(db), items: new CollectionItemsRepo(db), drafts: new DraftsRepo(db),
+    lease: new LeaseClaimer(db, 'processing_jobs'), llm, clock, workerId: 'proc-1', formTypes,
   })
+  const outboxWorker = new OutboxWorker({
+    db, outbox: new OutboxRepo(db), drafts: new DraftsRepo(db), blob,
+    lease: new LeaseClaimer(db, 'outbox'), clock, workerId: 'fill-1',
+  })
+
+  // The human-review surface. onEnqueued is the spec's PRIMARY wake-on-commit path: an approval
+  // nudges the fill worker immediately (the poll below is only the backstop). Not yet wired to an
+  // HTTP route (out of scope for this ticket — see file structure); exported for whatever review
+  // surface consumes it next.
+  reviewClient = new ReviewClient({
+    db, facts: new FactsRepo(db), drafts: new DraftsRepo(db), outbox: new OutboxRepo(db),
+    conflicts: new ConflictsRepo(db), clock, formTypes,
+    onEnqueued: () => {
+      fireAndReport(() => outboxWorker.drainOnce(), err => { console.error('outbox wake failed:', err) })
+    },
+  })
+
+  startAdaptiveLoop(() => processor.drainOnce(), {
+    onError: err => { console.error('processor poll failed:', err) },
+  })
+  startAdaptiveLoop(() => outboxWorker.drainOnce(), {
+    onError: err => { console.error('outbox poll failed:', err) },
+  })
+
+  const app = buildWebhookApp({
+    db,
+    clock,
+    wake: () => {
+      fireAndReport(() => processor.drainOnce(), err => { console.error('processor wake failed:', err) })
+    },
+  })
+
+  fireAndReport(
+    async () => {
+      await app.listen({ port: Number(env.PORT ?? 8080) })
+      console.log('webhook up')
+    },
+    err => {
+      // Production error posture: never swallow — an unhandled `listen()` rejection (e.g. the
+      // port is already in use) must be visible and must fail the process, not vanish into an
+      // unhandled-rejection warning.
+      console.error('failed to start webhook server:', err)
+      process.exitCode = 1
+    },
+  )
+
+  return { db, processor, outboxWorker, reviewClient, app }
+}
+
+function defaultBackgroundError(err: unknown): void {
+  console.error('background task failed:', err)
+}
+
+function isDirectRun(): boolean {
+  const entry = process.argv[1]
+  return entry !== undefined && resolve(entry) === fileURLToPath(import.meta.url)
+}
+
+if (isDirectRun()) startServer()

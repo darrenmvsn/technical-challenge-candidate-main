@@ -62,5 +62,5 @@ export function insertSourceAndJob(db: DB, args: { source: SourceRow; job: JobIn
     jobs.insert(args.job)
     return true
   })
-  return { inserted: tx() }
+  return { inserted: tx.immediate() }
 }

@@ -22,7 +22,8 @@
  * Queue/current-read hot paths get supporting indexes: job/outbox claim queries filter on
  * (status, next_attempt_at); the "current fact"/"current draft" reads filter on
  * (customer_id, field_path/form_type, superseded_by/superseded_by_revision); conflict
- * listing filters on (customer_id, status); source dedup checks by checksum.
+ * listing filters on (customer_id, status); source dedup checks by checksum. The checksum
+ * index is UNIQUE because checksum is the durable content-identity dedupe key.
  */
 export const DDL = `
 CREATE TABLE IF NOT EXISTS customers (
@@ -34,7 +35,7 @@ CREATE TABLE IF NOT EXISTS sources (
   source_date TEXT NOT NULL, received_at TEXT NOT NULL, raw_json TEXT NOT NULL,
   checksum TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'received'
 );
-CREATE INDEX IF NOT EXISTS idx_sources_checksum ON sources(checksum);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_checksum_unique ON sources(checksum);
 
 CREATE TABLE IF NOT EXISTS processing_jobs (
   id TEXT PRIMARY KEY, source_id TEXT NOT NULL, customer_id TEXT NOT NULL,

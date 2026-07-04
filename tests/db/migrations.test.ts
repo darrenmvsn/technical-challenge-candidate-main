@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it, expect } from 'vitest'
 import { openDb, migrate } from '../../src/db/sqlite.js'
 
@@ -32,6 +35,19 @@ describe('migrate', () => {
     const db = openDb()
     migrate(db)
     expect(() => migrate(db)).not.toThrow()
+  })
+
+  it('openDb creates the parent directory for a file-backed database path', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'acord-db-parent-'))
+    const dbPath = join(dir, 'nested', 'acord.db')
+    try {
+      const db = openDb(dbPath)
+      migrate(db)
+      expect(db.prepare('SELECT 1 ok').get()).toMatchObject({ ok: 1 })
+      db.close()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('rejects an invalid presence value on facts via CHECK constraint', () => {
@@ -110,5 +126,20 @@ describe('migrate', () => {
         )
         .run()
     ).not.toThrow()
+  })
+
+  it('enforces checksum uniqueness on sources at the database layer', () => {
+    const db = openDb()
+    migrate(db)
+    db.prepare(
+      `INSERT INTO sources (id, customer_id, type, source_date, received_at, raw_json, checksum, status)
+       VALUES ('s1','c1','call_transcript','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z','{}','same','received')`
+    ).run()
+    expect(() =>
+      db.prepare(
+        `INSERT INTO sources (id, customer_id, type, source_date, received_at, raw_json, checksum, status)
+         VALUES ('s2','c1','call_transcript','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z','{}','same','received')`
+      ).run()
+    ).toThrow()
   })
 })

@@ -1,6 +1,9 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it, expect } from 'vitest'
 import { fillForm } from '../../src/forms/fillForm.js'
-import { MemoryBlobStore } from '../../src/blob/blobStore.js'
+import { LocalBlobStore, MemoryBlobStore } from '../../src/blob/blobStore.js'
 
 describe('fillForm', () => {
   it('writes to a deterministic key derived from content', async () => {
@@ -41,5 +44,31 @@ describe('fillForm', () => {
     const bytes = Buffer.from('hello world')
     await blob.put('k1', bytes)
     expect(await blob.get('k1')).toEqual(bytes)
+  })
+
+  it('LocalBlobStore persists bytes across store instances', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'acord-blob-'))
+    try {
+      const first = new LocalBlobStore(dir)
+      const key = 'pdf/c1/acord_125/hash'
+      const bytes = Buffer.from('durable pdf bytes')
+      await first.put(key, bytes)
+
+      const second = new LocalBlobStore(dir)
+      expect(await second.get(key)).toEqual(bytes)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('LocalBlobStore rejects path traversal outside its root', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'acord-blob-'))
+    try {
+      const blob = new LocalBlobStore(dir)
+      await expect(blob.put('../escape', Buffer.from('x'))).rejects.toThrow()
+      await expect(blob.get('../escape')).rejects.toThrow()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
